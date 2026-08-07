@@ -84,6 +84,8 @@ set (HLSL_IGNORE_SOURCES
 )
 endif(WIN32)
 
+list(APPEND HLSL_IGNORE_SOURCES radray_abi_probe.cpp)
+
 set(LIBRARIES
   clangIndex
 #  clangARCMigrate
@@ -167,3 +169,12 @@ add_custom_target(install-dxcompiler
   COMMAND "${CMAKE_COMMAND}"
           -DCMAKE_INSTALL_COMPONENT=dxcompiler
           -P "${CMAKE_BINARY_DIR}/cmake_install.cmake")
+
+if (WIN32)
+  add_executable(radray_dxc_abi_probe EXCLUDE_FROM_ALL radray_abi_probe.cpp)
+  add_dependencies(radray_dxc_abi_probe dxcompiler)
+  target_include_directories(radray_dxc_abi_probe PRIVATE
+    ${LLVM_BINARY_DIR}/include
+    ${LLVM_MAIN_INCLUDE_DIR})
+  target_link_libraries(radray_dxc_abi_probe PRIVATE kernel32)
+endif()
