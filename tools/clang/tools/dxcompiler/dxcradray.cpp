@@ -533,6 +533,699 @@ bool ParseKeywordPragma(string_view line, KeywordGroup &group) {
   return !group.Name.empty() && !group.Values.empty();
 }
 
+constexpr uint32_t kMetadataNoParent = 0xffffffffu;
+
+enum class MetadataBindingKind : uint32_t {
+  CBuffer = 1,
+  Buffer = 2,
+  RWBuffer = 3,
+  Texture = 4,
+  RWTexture = 5,
+  Sampler = 6,
+};
+
+constexpr uint32_t kMetadataImmutableSampler = 1u << 0;
+
+struct MetadataStageSpan {
+  ShaderStage Stage{ShaderStage::Vertex};
+  string_view EntryName;
+  size_t Begin{0};
+  size_t End{0};
+};
+
+struct MetadataBindingFact {
+  string Name;
+  uint32_t Group{0};
+  uint32_t Binding{0};
+  uint32_t RegisterClass{0};
+  uint32_t Type{0};
+  uint32_t Count{1};
+  uint32_t StageMask{0};
+  uint32_t Flags{0};
+  bool HasExplicitBinding{false};
+};
+
+struct MetadataTypeFact {
+  string Name;
+  uint32_t ParentIndex{kMetadataNoParent};
+  uint32_t Kind{0};
+  uint32_t ElementCount{1};
+  uint32_t Offset{0};
+  uint32_t Size{0};
+  uint32_t Stride{0};
+  uint32_t Flags{0};
+};
+
+struct MetadataRootConstantFact {
+  uint32_t RegisterSpace{0};
+  uint32_t Register{0};
+  uint32_t Offset{0};
+  uint32_t Size{0};
+  uint32_t StageMask{0};
+  uint32_t Flags{0};
+};
+
+struct MetadataFacts {
+  vector<MetadataBindingFact> Bindings;
+  vector<MetadataTypeFact> Types;
+  vector<MetadataRootConstantFact> RootConstants;
+};
+
+struct MetadataStructDecl {
+  string Name;
+  string Body;
+};
+
+struct MetadataFieldDecl {
+  string Type;
+  string Name;
+  uint32_t ArrayCount{1};
+};
+
+struct MetadataLayoutInfo {
+  uint32_t Size{0};
+  uint32_t Align{4};
+};
+
+size_t MetadataSkipSpace(string_view text, size_t position) noexcept {
+  while (position < text.size() &&
+         std::isspace(static_cast<unsigned char>(text[position])) != 0)
+    ++position;
+  return position;
+}
+
+bool MetadataParseUnsigned(string_view text, size_t &position,
+                           uint32_t &value) noexcept {
+  position = MetadataSkipSpace(text, position);
+  const size_t begin = position;
+  uint64_t parsed = 0;
+  while (position < text.size() &&
+         std::isdigit(static_cast<unsigned char>(text[position])) != 0) {
+    parsed = parsed * 10 + static_cast<uint32_t>(text[position] - '0');
+    if (parsed > std::numeric_limits<uint32_t>::max())
+      return false;
+    ++position;
+  }
+  if (position == begin)
+    return false;
+  value = static_cast<uint32_t>(parsed);
+  return true;
+}
+
+bool MetadataParseBindingArguments(string_view text, size_t begin,
+                                   uint32_t &binding,
+                                   uint32_t &group) noexcept {
+  const size_t open = text.find('(', begin);
+  if (open == string_view::npos)
+    return false;
+  size_t cursor = open + 1;
+  if (!MetadataParseUnsigned(text, cursor, binding))
+    return false;
+  cursor = MetadataSkipSpace(text, cursor);
+  if (cursor >= text.size() || text[cursor] != ',')
+    return false;
+  ++cursor;
+  return MetadataParseUnsigned(text, cursor, group);
+}
+
+bool MetadataParseRegister(string_view text, uint32_t &binding,
+                           uint32_t &group) noexcept {
+  const size_t registerPosition = text.find("register(");
+  if (registerPosition == string_view::npos)
+    return false;
+  size_t cursor = registerPosition + 9;
+  cursor = MetadataSkipSpace(text, cursor);
+  if (cursor >= text.size() || (text[cursor] != 'b' && text[cursor] != 't' &&
+                                text[cursor] != 's' && text[cursor] != 'u'))
+    return false;
+  ++cursor;
+  if (!MetadataParseUnsigned(text, cursor, binding))
+    return false;
+  group = 0;
+  cursor = MetadataSkipSpace(text, cursor);
+  if (cursor < text.size() && text[cursor] == ',') {
+    ++cursor;
+    const size_t spacePosition = text.find("space", cursor);
+    if (spacePosition == string_view::npos)
+      return false;
+    cursor = spacePosition + 5;
+    cursor = MetadataSkipSpace(text, cursor);
+    if (cursor < text.size() && text[cursor] == '=')
+      ++cursor;
+    if (!MetadataParseUnsigned(text, cursor, group))
+      return false;
+  }
+  return true;
+}
+
+bool MetadataParseTargetBinding(string_view text, RadRayDxcTarget target,
+                               uint32_t &binding, uint32_t &group) noexcept {
+  if (target == RadRayDxcTarget::SPIRV) {
+    const size_t macro = text.find("VK_BINDING(");
+    const size_t attribute = text.find("vk::binding(");
+    if (macro != string_view::npos)
+      return MetadataParseBindingArguments(text, macro, binding, group);
+    if (attribute != string_view::npos)
+      return MetadataParseBindingArguments(text, attribute, binding, group);
+  }
+  return MetadataParseRegister(text, binding, group);
+}
+
+string MetadataReadIdentifier(string_view text, size_t &position) {
+  position = MetadataSkipSpace(text, position);
+  if (position >= text.size() || !IsIdentifierStart(text[position]))
+    return {};
+  const size_t begin = position++;
+  while (position < text.size() && IsIdentifierChar(text[position]))
+    ++position;
+  return string{text.substr(begin, position - begin)};
+}
+
+bool MetadataIsWordAt(string_view text, size_t position,
+                      string_view word) noexcept {
+  if (position > text.size() || text.substr(position, word.size()) != word)
+    return false;
+  const bool left = position == 0 || !IsIdentifierChar(text[position - 1]);
+  const size_t end = position + word.size();
+  const bool right = end >= text.size() || !IsIdentifierChar(text[end]);
+  return left && right;
+}
+
+uint32_t MetadataStageBit(ShaderStage stage) noexcept {
+  return 1u << static_cast<uint8_t>(stage);
+}
+
+const char *MetadataStageName(ShaderStage stage) noexcept {
+  switch (stage) {
+  case ShaderStage::Vertex:
+    return "vertex";
+  case ShaderStage::Pixel:
+    return "pixel";
+  case ShaderStage::Compute:
+    return "compute";
+  }
+  return "";
+}
+
+vector<MetadataStageSpan> FindMetadataStageSpans(
+    string_view source, const ContractData &contract) {
+  vector<MetadataStageSpan> result;
+  for (const EntryPoint &entry : contract.EntryPoints) {
+    const string marker = string{"[shader(\""} +
+                           MetadataStageName(entry.Stage) + "\")]";
+    const size_t begin = source.find(marker);
+    if (begin != string_view::npos)
+      result.push_back({entry.Stage, entry.Name, begin, source.size()});
+  }
+  std::sort(result.begin(), result.end(),
+            [](const MetadataStageSpan &lhs,
+               const MetadataStageSpan &rhs) noexcept {
+              return lhs.Begin < rhs.Begin;
+            });
+  for (size_t index = 1; index < result.size(); ++index)
+    result[index - 1].End = result[index].Begin;
+  return result;
+}
+
+string FindMetadataRootSignature(string_view source, size_t stageBegin) {
+  constexpr string_view prefix = "[RootSignature(\"";
+  size_t cursor = stageBegin;
+  while (cursor > 0) {
+    while (cursor > 0 &&
+           std::isspace(static_cast<unsigned char>(source[cursor - 1])) != 0)
+      --cursor;
+    if (cursor == 0 || source[cursor - 1] != ']')
+      break;
+    const size_t open = source.rfind('[', cursor - 1);
+    if (open == string_view::npos)
+      break;
+    const string_view attribute = Trim(source.substr(open, cursor - open));
+    if (StartsWith(attribute, prefix) && EndsWith(attribute, "\")]" ) &&
+        attribute.size() >= prefix.size() + 3)
+      return string{attribute.substr(prefix.size(),
+                                     attribute.size() - prefix.size() - 3)};
+    cursor = open;
+  }
+  return {};
+}
+
+bool ParseMetadataResourceLine(string_view line, RadRayDxcTarget target,
+                               MetadataBindingFact &result) {
+  line = Trim(line);
+  if (line.empty() || line.front() == '#' || StartsWith(line, "struct ") ||
+      line.front() == '[')
+    return false;
+
+  string_view typeToken;
+  MetadataBindingKind kind = MetadataBindingKind::Texture;
+  constexpr string_view tokens[] = {
+      "RWStructuredBuffer", "StructuredBuffer", "RWByteAddressBuffer",
+      "ByteAddressBuffer",  "RWTexture",       "Texture",
+      "SamplerState",       "SamplerComparisonState", "ConstantBuffer",
+      "cbuffer"};
+  constexpr MetadataBindingKind kinds[] = {
+      MetadataBindingKind::RWBuffer, MetadataBindingKind::Buffer,
+      MetadataBindingKind::RWBuffer, MetadataBindingKind::Buffer,
+      MetadataBindingKind::RWTexture, MetadataBindingKind::Texture,
+      MetadataBindingKind::Sampler, MetadataBindingKind::Sampler,
+      MetadataBindingKind::CBuffer, MetadataBindingKind::CBuffer};
+  size_t typePosition = string_view::npos;
+  for (size_t index = 0; index < std::size(tokens); ++index) {
+    const size_t candidate = line.find(tokens[index]);
+    if (candidate != string_view::npos &&
+        (typePosition == string_view::npos || candidate < typePosition)) {
+      typePosition = candidate;
+      typeToken = tokens[index];
+      kind = kinds[index];
+    }
+  }
+  if (typePosition == string_view::npos)
+    return false;
+
+  size_t namePosition = typePosition + typeToken.size();
+  const size_t templateEnd = line.find('>', namePosition);
+  if (templateEnd != string_view::npos &&
+      line.find('<', namePosition) < templateEnd)
+    namePosition = templateEnd + 1;
+  result.Name = MetadataReadIdentifier(line, namePosition);
+  if (result.Name.empty())
+    return false;
+  namePosition = MetadataSkipSpace(line, namePosition);
+  if (namePosition < line.size() && line[namePosition] == '[') {
+    ++namePosition;
+    if (!MetadataParseUnsigned(line, namePosition, result.Count) ||
+        line.find(']', namePosition) == string_view::npos)
+      return false;
+  }
+  result.Type = static_cast<uint32_t>(kind);
+  switch (kind) {
+  case MetadataBindingKind::CBuffer:
+    result.RegisterClass = 0;
+    break;
+  case MetadataBindingKind::Buffer:
+  case MetadataBindingKind::Texture:
+    result.RegisterClass = 1;
+    break;
+  case MetadataBindingKind::RWBuffer:
+  case MetadataBindingKind::RWTexture:
+    result.RegisterClass = 2;
+    break;
+  case MetadataBindingKind::Sampler:
+    result.RegisterClass = 3;
+    break;
+  }
+  result.HasExplicitBinding = MetadataParseTargetBinding(
+      line, target, result.Binding, result.Group);
+  return true;
+}
+
+bool MetadataUsesIdentifier(string_view text, string_view name) noexcept {
+  size_t cursor = 0;
+  while ((cursor = text.find(name, cursor)) != string_view::npos) {
+    const bool left = cursor == 0 || !IsIdentifierChar(text[cursor - 1]);
+    const size_t end = cursor + name.size();
+    const bool right = end >= text.size() || !IsIdentifierChar(text[end]);
+    if (left && right)
+      return true;
+    cursor = end;
+  }
+  return false;
+}
+
+vector<MetadataStructDecl> ParseMetadataStructs(string_view source) {
+  vector<MetadataStructDecl> result;
+  size_t cursor = 0;
+  while ((cursor = source.find("struct", cursor)) != string_view::npos) {
+    if (!MetadataIsWordAt(source, cursor, "struct")) {
+      ++cursor;
+      continue;
+    }
+    size_t namePosition = cursor + 6;
+    string name = MetadataReadIdentifier(source, namePosition);
+    const size_t open = source.find('{', namePosition);
+    if (name.empty() || open == string_view::npos) {
+      cursor += 6;
+      continue;
+    }
+    uint32_t depth = 1;
+    size_t close = open + 1;
+    for (; close < source.size() && depth != 0; ++close) {
+      if (source[close] == '{')
+        ++depth;
+      else if (source[close] == '}')
+        --depth;
+    }
+    if (depth != 0)
+      break;
+    result.push_back({std::move(name), string{source.substr(open + 1,
+                                                             close - open - 2)}});
+    cursor = close;
+  }
+  return result;
+}
+
+vector<MetadataFieldDecl> ParseMetadataFields(string_view body) {
+  vector<MetadataFieldDecl> result;
+  size_t begin = 0;
+  while (begin < body.size()) {
+    const size_t end = body.find(';', begin);
+    const string_view statement = Trim(body.substr(
+        begin, end == string_view::npos ? body.size() - begin : end - begin));
+    begin = end == string_view::npos ? body.size() : end + 1;
+    if (statement.empty() || statement.find('{') != string_view::npos)
+      continue;
+    size_t cursor = 0;
+    string type = MetadataReadIdentifier(statement, cursor);
+    string name = MetadataReadIdentifier(statement, cursor);
+    if (type.empty() || name.empty())
+      continue;
+    uint32_t arrayCount = 1;
+    cursor = MetadataSkipSpace(statement, cursor);
+    if (cursor < statement.size() && statement[cursor] == '[') {
+      ++cursor;
+      if (!MetadataParseUnsigned(statement, cursor, arrayCount))
+        continue;
+    }
+    result.push_back({std::move(type), std::move(name), arrayCount});
+  }
+  return result;
+}
+
+MetadataLayoutInfo MetadataPrimitiveLayout(string_view type) noexcept {
+  if (type == "float" || type == "int" || type == "uint" ||
+      type == "bool")
+    return {4, 4};
+  if (type == "float2" || type == "int2" || type == "uint2")
+    return {8, 8};
+  if (type == "float3" || type == "int3" || type == "uint3")
+    return {12, 16};
+  if (type == "float4" || type == "int4" || type == "uint4")
+    return {16, 16};
+  if (type == "float3x3")
+    return {48, 16};
+  if (type == "float4x4")
+    return {64, 16};
+  return {0, 4};
+}
+
+MetadataLayoutInfo FindMetadataStructLayout(
+    string_view type, const vector<MetadataStructDecl> &structs,
+    vector<bool> &visiting, vector<MetadataLayoutInfo> &layouts) {
+  const auto found = std::find_if(
+      structs.begin(), structs.end(),
+      [&](const MetadataStructDecl &value) noexcept { return value.Name == type; });
+  if (found == structs.end())
+    return MetadataPrimitiveLayout(type);
+  const size_t index = static_cast<size_t>(found - structs.begin());
+  if (layouts[index].Size != 0)
+    return layouts[index];
+  if (visiting[index])
+    return {};
+  visiting[index] = true;
+  uint32_t offset = 0;
+  uint32_t alignment = 16;
+  for (const MetadataFieldDecl &field : ParseMetadataFields(found->Body)) {
+    const MetadataLayoutInfo fieldLayout = FindMetadataStructLayout(
+        field.Type, structs, visiting, layouts);
+    alignment = std::max(alignment, fieldLayout.Align);
+    offset = (offset + fieldLayout.Align - 1) / fieldLayout.Align *
+             fieldLayout.Align;
+    const uint64_t size = static_cast<uint64_t>(fieldLayout.Size) *
+                          field.ArrayCount;
+    offset = size > std::numeric_limits<uint32_t>::max() - offset
+                 ? 0
+                 : offset + static_cast<uint32_t>(size);
+  }
+  const uint32_t size = (offset + alignment - 1) / alignment * alignment;
+  layouts[index] = {size == 0 ? 16u : size, alignment};
+  visiting[index] = false;
+  return layouts[index];
+}
+
+void AddMetadataTypeFacts(const vector<MetadataStructDecl> &structs,
+                          size_t structIndex, uint32_t parent,
+                          vector<bool> &visiting,
+                          vector<MetadataLayoutInfo> &layouts,
+                          vector<MetadataTypeFact> &output) {
+  if (structIndex >= structs.size() || visiting[structIndex])
+    return;
+  const MetadataLayoutInfo layout = FindMetadataStructLayout(
+      structs[structIndex].Name, structs, visiting, layouts);
+  visiting[structIndex] = true;
+  const uint32_t ownIndex = static_cast<uint32_t>(output.size());
+  output.push_back({structs[structIndex].Name, parent,
+                    4u, 1u, 0u, layout.Size, layout.Size, 0u});
+  uint32_t offset = 0;
+  for (const MetadataFieldDecl &field :
+       ParseMetadataFields(structs[structIndex].Body)) {
+    const MetadataLayoutInfo fieldLayout = FindMetadataStructLayout(
+        field.Type, structs, visiting, layouts);
+    offset = (offset + fieldLayout.Align - 1) / fieldLayout.Align *
+             fieldLayout.Align;
+    const bool isStruct = std::any_of(
+        structs.begin(), structs.end(),
+        [&](const MetadataStructDecl &value) noexcept {
+          return value.Name == field.Type;
+        });
+    uint32_t kind = isStruct ? 4u : 1u;
+    if (field.Type.find('x') != string_view::npos)
+      kind = 3u;
+    else if (field.Type.size() > 1 &&
+             std::isdigit(static_cast<unsigned char>(field.Type.back())) != 0)
+      kind = 2u;
+    if (field.ArrayCount > 1)
+      kind = 5u;
+    const uint32_t size = fieldLayout.Size * field.ArrayCount;
+    output.push_back({field.Name, ownIndex, kind, field.ArrayCount, offset,
+                      size, fieldLayout.Size, 0u});
+    offset += size;
+  }
+  visiting[structIndex] = false;
+}
+
+bool ParseMetadataRootConstants(string_view source,
+                                const vector<MetadataStageSpan> &stages,
+                                RadRayDxcTarget target,
+                                MetadataFacts &facts) {
+  if (target == RadRayDxcTarget::DXIL) {
+    size_t cursor = 0;
+    while ((cursor = source.find("RootConstants(", cursor)) !=
+           string_view::npos) {
+      const size_t begin = cursor + 14;
+      const size_t end = source.find(')', begin);
+      if (end == string_view::npos)
+        return false;
+      const string_view args = source.substr(begin, end - begin);
+      const size_t countPosition = args.find("num32BitConstants=");
+      const size_t registerPosition = args.find('b');
+      const size_t spacePosition = args.find("space=");
+      if (countPosition == string_view::npos ||
+          registerPosition == string_view::npos ||
+          spacePosition == string_view::npos)
+        return false;
+      size_t countCursor = countPosition + 18;
+      size_t registerCursor = registerPosition + 1;
+      size_t spaceCursor = spacePosition + 6;
+      uint32_t count = 0;
+      uint32_t binding = 0;
+      uint32_t group = 0;
+      if (!MetadataParseUnsigned(args, countCursor, count) ||
+          !MetadataParseUnsigned(args, registerCursor, binding) ||
+          !MetadataParseUnsigned(args, spaceCursor, group) || count == 0)
+        return false;
+      uint32_t stageMask = 0;
+      for (const MetadataStageSpan &stage : stages)
+        stageMask |= MetadataStageBit(stage.Stage);
+      facts.RootConstants.push_back(
+          {group, binding, 0, count * 4, stageMask, 0});
+      cursor = end + 1;
+    }
+  }
+
+  if (target != RadRayDxcTarget::SPIRV)
+    return true;
+  uint32_t pushCount = 0;
+  size_t cursor = 0;
+  while ((cursor = source.find("vk::push_constant", cursor)) !=
+         string_view::npos) {
+    ++pushCount;
+    cursor += 18;
+  }
+  cursor = 0;
+  while ((cursor = source.find("VK_PUSH_CONSTANT", cursor)) !=
+         string_view::npos) {
+    ++pushCount;
+    cursor += 16;
+  }
+  if (pushCount == 0)
+    return true;
+  if (pushCount != 1 || !facts.RootConstants.empty())
+    return false;
+  uint32_t stageMask = 0;
+  for (const MetadataStageSpan &stage : stages)
+    stageMask |= MetadataStageBit(stage.Stage);
+  facts.RootConstants.push_back({0, 0, 0, 16, stageMask, 1});
+  return true;
+}
+
+bool BuildMetadataFacts(string_view source, const ContractData &contract,
+                        RadRayDxcTarget target, MetadataFacts &facts,
+                        vector<Diagnostic> &diagnostics) {
+  const string cleaned = CleanSource(source);
+  const vector<MetadataStageSpan> stages =
+      FindMetadataStageSpans(cleaned, contract);
+  if (stages.size() != contract.EntryPoints.size()) {
+    diagnostics.push_back(
+        {2101, "metadata builder could not locate every discovered entry point"});
+    return false;
+  }
+
+  if (contract.Kind == ShaderKind::Graphics &&
+      target == RadRayDxcTarget::DXIL) {
+    string explicitRootSignature;
+    bool hasExplicitRootSignature = false;
+    for (const MetadataStageSpan &stage : stages) {
+      const string signature = FindMetadataRootSignature(cleaned, stage.Begin);
+      if (signature.empty())
+        continue;
+      if (!hasExplicitRootSignature) {
+        explicitRootSignature = signature;
+        hasExplicitRootSignature = true;
+      } else if (signature != explicitRootSignature) {
+        diagnostics.push_back(
+            {2105, "graphics stages declare different RootSignature attributes"});
+        return false;
+      }
+    }
+  }
+
+  vector<MetadataBindingFact> declarations;
+  uint32_t braceDepth = 0;
+  size_t lineStart = 0;
+  string pendingAttribute;
+  while (lineStart <= cleaned.size()) {
+    const size_t lineEnd = cleaned.find_first_of("\r\n", lineStart);
+    const size_t boundedEnd = lineEnd == string::npos ? cleaned.size() : lineEnd;
+    string line{Trim(string_view{cleaned}.substr(lineStart,
+                                                   boundedEnd - lineStart))};
+    if (line.find("VK_BINDING(") != string_view::npos ||
+        line.find("vk::binding(") != string_view::npos)
+      pendingAttribute += line;
+    for (const char character : line) {
+      if (character == '{')
+        ++braceDepth;
+      else if (character == '}' && braceDepth != 0)
+        --braceDepth;
+    }
+    if (braceDepth == 0 && line.find(';') != string_view::npos) {
+      if (!pendingAttribute.empty()) {
+        line = pendingAttribute + line;
+        pendingAttribute.clear();
+      }
+      MetadataBindingFact binding;
+      if (ParseMetadataResourceLine(line, target, binding))
+        declarations.push_back(std::move(binding));
+    }
+    if (lineEnd == string_view::npos)
+      break;
+    lineStart = lineEnd + 1;
+    if (lineStart < cleaned.size() && cleaned[lineEnd] == '\r' &&
+        cleaned[lineStart] == '\n')
+      ++lineStart;
+  }
+
+  uint32_t nextBinding[4] = {};
+  for (MetadataBindingFact &declaration : declarations) {
+    uint32_t stageMask = 0;
+    for (const MetadataStageSpan &stage : stages) {
+      if (MetadataUsesIdentifier(
+              cleaned.substr(stage.Begin, stage.End - stage.Begin),
+              declaration.Name))
+        stageMask |= MetadataStageBit(stage.Stage);
+    }
+    if (stageMask == 0)
+      continue;
+    declaration.StageMask = stageMask;
+    if (!declaration.HasExplicitBinding) {
+      while (std::any_of(
+          declarations.begin(), declarations.end(),
+          [&](const MetadataBindingFact &value) noexcept {
+            return value.HasExplicitBinding &&
+                   value.RegisterClass == declaration.RegisterClass &&
+                   value.Group == declaration.Group &&
+                   value.Binding == nextBinding[declaration.RegisterClass];
+          }))
+        ++nextBinding[declaration.RegisterClass];
+      declaration.Binding = nextBinding[declaration.RegisterClass]++;
+    }
+    const auto existing = std::find_if(
+        facts.Bindings.begin(), facts.Bindings.end(),
+        [&](const MetadataBindingFact &value) noexcept {
+          return value.Name == declaration.Name;
+        });
+    if (existing != facts.Bindings.end()) {
+      diagnostics.push_back({2102, "duplicate active binding declaration"});
+      return false;
+    }
+    facts.Bindings.push_back(std::move(declaration));
+  }
+
+  const vector<MetadataStructDecl> structs = ParseMetadataStructs(cleaned);
+  vector<bool> visiting(structs.size(), false);
+  vector<MetadataLayoutInfo> layouts(structs.size());
+  for (size_t index = 0; index < structs.size(); ++index)
+    AddMetadataTypeFacts(structs, index, kMetadataNoParent, visiting, layouts,
+                         facts.Types);
+  if (!ParseMetadataRootConstants(cleaned, stages, target, facts)) {
+    diagnostics.push_back(
+        {2103, "shader source contains an invalid push/root constant declaration"});
+    return false;
+  }
+
+  vector<uint32_t> staticSamplerRegisters;
+  size_t staticSamplerCursor = 0;
+  while ((staticSamplerCursor = cleaned.find("StaticSampler(",
+                                             staticSamplerCursor)) !=
+         string_view::npos) {
+    size_t registerCursor = staticSamplerCursor + 14;
+    registerCursor = MetadataSkipSpace(cleaned, registerCursor);
+    if (registerCursor >= cleaned.size() || cleaned[registerCursor] != 's') {
+      diagnostics.push_back({2104, "static sampler declaration is malformed"});
+      return false;
+    }
+    ++registerCursor;
+    uint32_t registerIndex = 0;
+    if (!MetadataParseUnsigned(cleaned, registerCursor, registerIndex) ||
+        std::find(staticSamplerRegisters.begin(), staticSamplerRegisters.end(),
+                  registerIndex) != staticSamplerRegisters.end()) {
+      diagnostics.push_back(
+          {2104, "static sampler register is duplicated or malformed"});
+      return false;
+    }
+    staticSamplerRegisters.push_back(registerIndex);
+    staticSamplerCursor = registerCursor;
+  }
+  const size_t activeSamplerCount = static_cast<size_t>(std::count_if(
+      facts.Bindings.begin(), facts.Bindings.end(),
+      [](const MetadataBindingFact &binding) noexcept {
+        return binding.Type ==
+               static_cast<uint32_t>(MetadataBindingKind::Sampler);
+      }));
+  if (staticSamplerRegisters.size() > activeSamplerCount) {
+    diagnostics.push_back(
+        {2104, "static sampler has no matching active sampler declaration"});
+    return false;
+  }
+  if (!staticSamplerRegisters.empty()) {
+    for (MetadataBindingFact &binding : facts.Bindings) {
+      if (binding.Type ==
+          static_cast<uint32_t>(MetadataBindingKind::Sampler))
+        binding.Flags |= kMetadataImmutableSampler;
+    }
+  }
+  return true;
+}
+
 Hash128 MakeContractHash(const ContractData &contract) {
   uint64_t first = 1469598103934665603ull;
   uint64_t second = 1099511628211ull;
@@ -784,9 +1477,9 @@ bool ExpandSourceInternal(string_view source, const CompileRequest &request,
       const size_t endName = trimmed.find(closing, begin + 1);
       if (endName == string_view::npos)
         return false;
-      IncludeSource *found = nullptr;
+      const IncludeSource *found = nullptr;
       const string logicalName = NormalizeInclude(string{trimmed.substr(begin + 1, endName - begin - 1)});
-      for (IncludeSource &include : const_cast<vector<IncludeSource> &>(request.Includes)) {
+      for (const IncludeSource &include : request.Includes) {
         if (include.Name == logicalName) {
           found = &include;
           break;
@@ -949,10 +1642,43 @@ struct WireEntryRecord {
   uint32_t InterfaceSize;
   uint32_t Reserved2;
 };
+
+struct WireBindingRecord {
+  WireRange Name;
+  uint32_t Group;
+  uint32_t Binding;
+  uint32_t Type;
+  uint32_t Count;
+  uint32_t StageMask;
+  uint32_t Flags;
+};
+
+struct WireTypeRecord {
+  WireRange Name;
+  uint32_t ParentIndex;
+  uint32_t Kind;
+  uint32_t ElementCount;
+  uint32_t Offset;
+  uint32_t Size;
+  uint32_t Stride;
+  uint32_t Flags;
+};
+
+struct WireRootConstantRecord {
+  uint32_t RegisterSpace;
+  uint32_t Register;
+  uint32_t Offset;
+  uint32_t Size;
+  uint32_t StageMask;
+  uint32_t Flags;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(WireEnvelope) == 144);
 static_assert(sizeof(WireEntryRecord) == 24);
+static_assert(sizeof(WireBindingRecord) == 32);
+static_assert(sizeof(WireTypeRecord) == 36);
+static_assert(sizeof(WireRootConstantRecord) == 24);
 
 vector<uint8_t> EncodeCompileInput(const CompileRequest &request,
                                    RadRayDxcTarget target,
@@ -994,18 +1720,36 @@ vector<uint8_t> EncodeCompileInput(const CompileRequest &request,
   return bytes;
 }
 
-vector<uint8_t> BuildMetadata(const CompileRequest &request,
-                              const ContractData &contract,
-                              RadRayDxcTarget target,
-                              const vector<StageOutput> &stages,
-                              const Hash128 &compileInput) {
+bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
+                   RadRayDxcTarget target, const vector<StageOutput> &stages,
+                   const Hash128 &compileInput, vector<Diagnostic> &diagnostics,
+                   vector<uint8_t> &metadata) {
+  MetadataFacts facts;
+  const string rootSource(reinterpret_cast<const char *>(request.RootSource.data()),
+                          request.RootSource.size());
+  if (!BuildMetadataFacts(rootSource, contract, target, facts, diagnostics))
+    return false;
+
   const uint32_t entryOffset = sizeof(WireEnvelope);
   const uint32_t entryBytes = static_cast<uint32_t>(
       contract.EntryPoints.size() * sizeof(WireEntryRecord));
-  const uint32_t nameOffset = entryOffset + entryBytes;
+  const uint32_t bindingOffset = entryOffset + entryBytes;
+  const uint32_t bindingBytes = static_cast<uint32_t>(
+      facts.Bindings.size() * sizeof(WireBindingRecord));
+  const uint32_t typeOffset = bindingOffset + bindingBytes;
+  const uint32_t typeBytes = static_cast<uint32_t>(
+      facts.Types.size() * sizeof(WireTypeRecord));
+  const uint32_t rootConstantOffset = typeOffset + typeBytes;
+  const uint32_t rootConstantBytes = static_cast<uint32_t>(
+      facts.RootConstants.size() * sizeof(WireRootConstantRecord));
+  const uint32_t nameOffset = rootConstantOffset + rootConstantBytes;
   uint32_t nameBytes = 0;
   for (const EntryPoint &entry : contract.EntryPoints)
     nameBytes += static_cast<uint32_t>(entry.Name.size());
+  for (const MetadataBindingFact &binding : facts.Bindings)
+    nameBytes += static_cast<uint32_t>(binding.Name.size());
+  for (const MetadataTypeFact &type : facts.Types)
+    nameBytes += static_cast<uint32_t>(type.Name.size());
   const uint32_t bytecodeOffset = nameOffset + nameBytes;
   uint32_t bytecodeSize = 0;
   for (const StageOutput &stage : stages)
@@ -1018,9 +1762,9 @@ vector<uint8_t> BuildMetadata(const CompileRequest &request,
   envelope.TotalSize = bytecodeOffset + bytecodeSize;
   envelope.Target = target == RadRayDxcTarget::DXIL ? 0 : 1;
   envelope.EntryRecords = {entryOffset, entryBytes};
-  envelope.BindingRecords = {0, 0};
-  envelope.TypeRecords = {0, 0};
-  envelope.RootConstantRecords = {0, 0};
+  envelope.BindingRecords = {bindingOffset, bindingBytes};
+  envelope.TypeRecords = {typeOffset, typeBytes};
+  envelope.RootConstantRecords = {rootConstantOffset, rootConstantBytes};
   envelope.Bytecode = {bytecodeOffset, bytecodeSize};
   envelope.ToolchainIdentity = kMetadataToolchainIdentity;
   std::memcpy(envelope.Contract, contract.Hash.Bytes, sizeof(envelope.Contract));
@@ -1040,14 +1784,63 @@ vector<uint8_t> BuildMetadata(const CompileRequest &request,
     currentNameOffset += static_cast<uint32_t>(entry.Name.size());
     currentInterfaceOffset += record.InterfaceSize;
     entries.push_back(record);
+    envelope.StageMask |= static_cast<uint8_t>(1u << static_cast<uint8_t>(entry.Stage));
   }
 
+  vector<WireBindingRecord> bindings;
+  bindings.reserve(facts.Bindings.size());
+  for (const MetadataBindingFact &fact : facts.Bindings) {
+    WireBindingRecord record{};
+    record.Name = {currentNameOffset, static_cast<uint32_t>(fact.Name.size())};
+    record.Group = fact.Group;
+    record.Binding = fact.Binding;
+    record.Type = fact.Type;
+    record.Count = fact.Count;
+    record.StageMask = fact.StageMask;
+    record.Flags = fact.Flags;
+    bindings.push_back(record);
+    currentNameOffset += static_cast<uint32_t>(fact.Name.size());
+  }
+
+  vector<WireTypeRecord> types;
+  types.reserve(facts.Types.size());
+  for (const MetadataTypeFact &fact : facts.Types) {
+    WireTypeRecord record{};
+    record.Name = {currentNameOffset, static_cast<uint32_t>(fact.Name.size())};
+    record.ParentIndex = fact.ParentIndex;
+    record.Kind = fact.Kind;
+    record.ElementCount = fact.ElementCount;
+    record.Offset = fact.Offset;
+    record.Size = fact.Size;
+    record.Stride = fact.Stride;
+    record.Flags = fact.Flags;
+    types.push_back(record);
+    currentNameOffset += static_cast<uint32_t>(fact.Name.size());
+  }
+
+  vector<WireRootConstantRecord> rootConstants;
+  rootConstants.reserve(facts.RootConstants.size());
+  for (const MetadataRootConstantFact &fact : facts.RootConstants)
+    rootConstants.push_back({fact.RegisterSpace, fact.Register, fact.Offset,
+                             fact.Size, fact.StageMask, fact.Flags});
+
+  envelope.TotalSize = bytecodeOffset + bytecodeSize;
   vector<uint8_t> layoutBytes;
-  layoutBytes.reserve(entryBytes + nameBytes);
-  const auto *entryData = reinterpret_cast<const uint8_t *>(entries.data());
-  layoutBytes.insert(layoutBytes.end(), entryData, entryData + entryBytes);
+  layoutBytes.reserve(bindingBytes + rootConstantBytes + nameBytes);
+  if (!bindings.empty()) {
+    const auto *data = reinterpret_cast<const uint8_t *>(bindings.data());
+    layoutBytes.insert(layoutBytes.end(), data, data + bindingBytes);
+  }
+  if (!rootConstants.empty()) {
+    const auto *data = reinterpret_cast<const uint8_t *>(rootConstants.data());
+    layoutBytes.insert(layoutBytes.end(), data, data + rootConstantBytes);
+  }
   for (const EntryPoint &entry : contract.EntryPoints)
     layoutBytes.insert(layoutBytes.end(), entry.Name.begin(), entry.Name.end());
+  for (const MetadataBindingFact &binding : facts.Bindings)
+    layoutBytes.insert(layoutBytes.end(), binding.Name.begin(), binding.Name.end());
+  for (const MetadataTypeFact &type : facts.Types)
+    layoutBytes.insert(layoutBytes.end(), type.Name.begin(), type.Name.end());
   const Hash128 bytecodeHash = [&]() {
     vector<uint8_t> bytes;
     bytes.reserve(bytecodeSize);
@@ -1065,21 +1858,38 @@ vector<uint8_t> BuildMetadata(const CompileRequest &request,
               sizeof(envelope.PipelineLayoutDigest));
   std::memcpy(envelope.GpuArtifact, gpuHash.Bytes, sizeof(envelope.GpuArtifact));
 
-  vector<uint8_t> metadata(envelope.TotalSize, 0);
+  metadata.assign(envelope.TotalSize, 0);
   std::memcpy(metadata.data(), &envelope, sizeof(envelope));
   if (!entries.empty())
     std::memcpy(metadata.data() + entryOffset, entries.data(), entryBytes);
+  if (!bindings.empty())
+    std::memcpy(metadata.data() + bindingOffset, bindings.data(), bindingBytes);
+  if (!types.empty())
+    std::memcpy(metadata.data() + typeOffset, types.data(), typeBytes);
+  if (!rootConstants.empty())
+    std::memcpy(metadata.data() + rootConstantOffset, rootConstants.data(),
+                rootConstantBytes);
   currentNameOffset = nameOffset;
   for (const EntryPoint &entry : contract.EntryPoints) {
     std::memcpy(metadata.data() + currentNameOffset, entry.Name.data(), entry.Name.size());
     currentNameOffset += static_cast<uint32_t>(entry.Name.size());
+  }
+  for (const MetadataBindingFact &binding : facts.Bindings) {
+    std::memcpy(metadata.data() + currentNameOffset, binding.Name.data(),
+                binding.Name.size());
+    currentNameOffset += static_cast<uint32_t>(binding.Name.size());
+  }
+  for (const MetadataTypeFact &type : facts.Types) {
+    std::memcpy(metadata.data() + currentNameOffset, type.Name.data(),
+                type.Name.size());
+    currentNameOffset += static_cast<uint32_t>(type.Name.size());
   }
   uint32_t currentBytecodeOffset = bytecodeOffset;
   for (const StageOutput &stage : stages) {
     std::memcpy(metadata.data() + currentBytecodeOffset, stage.Bytecode.data(), stage.Bytecode.size());
     currentBytecodeOffset += static_cast<uint32_t>(stage.Bytecode.size());
   }
-  return metadata;
+  return true;
 }
 
 class RadRayDxcResult : public IRadRayDxcResult {
@@ -1378,7 +2188,15 @@ public:
       vector<uint8_t> bytecode;
       for (const StageOutput &stage : stages)
         AppendBytes(bytecode, stage.Bytecode);
-      vector<uint8_t> metadata = BuildMetadata(parsed, contract, target, stages, inputHash);
+      vector<uint8_t> metadata;
+      if (!BuildMetadata(parsed, contract, target, stages, inputHash,
+                         compileDiagnostics, metadata)) {
+        output->SetStatus(RadRayDxcCompileStatus::TargetFailure);
+        output->ClearLanes();
+        for (Diagnostic &diagnostic : compileDiagnostics)
+          output->AddDiagnostic(diagnostic.Code, std::move(diagnostic.Message));
+        return PublishResult(output, result);
+      }
       output->SetLane(target, std::move(bytecode), std::move(metadata));
     }
     output->SetStatus(RadRayDxcCompileStatus::Success);
