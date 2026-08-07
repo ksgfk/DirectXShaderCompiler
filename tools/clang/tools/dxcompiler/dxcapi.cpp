@@ -19,6 +19,7 @@
 
 #include "dxc/Support/Global.h"
 #include "dxc/config.h"
+#include "dxc/dxcapi_radrayext.h"
 #include "dxc/dxcisense.h"
 #include "dxc/dxctools.h"
 #ifdef _WIN32
@@ -39,6 +40,7 @@ HRESULT CreateDxcOptimizer(REFIID riid, _Out_ LPVOID *ppv);
 HRESULT CreateDxcContainerBuilder(REFIID riid, _Out_ LPVOID *ppv);
 HRESULT CreateDxcLinker(REFIID riid, _Out_ LPVOID *ppv);
 HRESULT CreateDxcPdbUtils(REFIID riid, _Out_ LPVOID *ppv);
+HRESULT CreateRadRayDxcCompiler(REFIID riid, _Out_ LPVOID *ppv);
 
 namespace hlsl {
 void CreateDxcContainerReflection(IDxcContainerReflection **ppResult);
@@ -72,6 +74,9 @@ static HRESULT ThreadMallocDxcCreateInstance(REFCLSID rclsid, REFIID riid,
   *ppv = nullptr;
   if (IsEqualCLSID(rclsid, CLSID_DxcCompiler)) {
     hr = CreateDxcCompiler(riid, ppv);
+  } else if (IsEqualCLSID(rclsid,
+                          radray::shader::CLSID_RadRayDxcCompiler)) {
+    hr = CreateRadRayDxcCompiler(riid, ppv);
   } else if (IsEqualCLSID(rclsid, CLSID_DxcCompilerArgs)) {
     hr = CreateDxcCompilerArgs(riid, ppv);
   } else if (IsEqualCLSID(rclsid, CLSID_DxcUtils)) {

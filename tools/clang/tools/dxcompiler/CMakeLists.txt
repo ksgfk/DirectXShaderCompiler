@@ -49,6 +49,7 @@ set(LLVM_LINK_COMPONENTS
 if (WIN32)
 set(SOURCES
   dxcapi.cpp
+  dxcradray.cpp
   dxcassembler.cpp
   dxclibrary.cpp
   dxcompilerobj.cpp
