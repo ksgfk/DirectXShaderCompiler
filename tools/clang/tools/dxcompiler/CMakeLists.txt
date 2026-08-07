@@ -155,14 +155,13 @@ set_target_properties(dxcompiler
   DEFINE_SYMBOL _CINDEX_LIB_)
 
 if (WIN32)
-  set(install_dest RUNTIME DESTINATION bin)
+  install(TARGETS dxcompiler
+    RUNTIME DESTINATION bin COMPONENT dxcompiler
+    ARCHIVE DESTINATION lib COMPONENT dxcompiler)
 else()
-  set(install_dest LIBRARY DESTINATION lib${LLVM_LIBDIR_SUFFIX})
+  install(TARGETS dxcompiler
+    LIBRARY DESTINATION lib${LLVM_LIBDIR_SUFFIX} COMPONENT dxcompiler)
 endif()
-
-install(TARGETS dxcompiler
-  ${install_dest}
-  COMPONENT dxcompiler)
 
 add_custom_target(install-dxcompiler
   DEPENDS dxcompiler

@@ -1,0 +1,23 @@
+@PACKAGE_INIT@
+
+set(RadRayDXC_VERSION "@RADRAY_DXC_PACKAGE_VERSION@")
+set(RadRayDXC_Headers_FOUND TRUE)
+set(RadRayDXC_Compiler_FOUND TRUE)
+set(RadRayDXC_Validator_FOUND FALSE)
+set(RadRayDXC_CLI_FOUND FALSE)
+
+if (NOT TARGET RadRayDXC::Headers)
+  add_library(RadRayDXC::Headers INTERFACE IMPORTED)
+  set_target_properties(RadRayDXC::Headers PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES "${PACKAGE_PREFIX_DIR}/include")
+endif()
+
+if (NOT TARGET RadRayDXC::Compiler)
+  add_library(RadRayDXC::Compiler SHARED IMPORTED)
+  set_target_properties(RadRayDXC::Compiler PROPERTIES
+    IMPORTED_IMPLIB "${PACKAGE_PREFIX_DIR}/lib/dxcompiler.lib"
+    IMPORTED_LOCATION "${PACKAGE_PREFIX_DIR}/bin/dxcompiler.dll"
+    INTERFACE_LINK_LIBRARIES RadRayDXC::Headers)
+endif()
+
+check_required_components(RadRayDXC)

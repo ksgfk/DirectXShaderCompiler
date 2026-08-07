@@ -25,6 +25,22 @@ endif()
 
 project(LLVM)
 
+include(CMakePackageConfigHelpers)
+set(RADRAY_DXC_PACKAGE_VERSION "1.9.2607+radray.1")
+configure_package_config_file(
+  ${CMAKE_SOURCE_DIR}/cmake/RadRayDXCConfig.cmake.in
+  ${CMAKE_BINARY_DIR}/RadRayDXCConfig.cmake
+  INSTALL_DESTINATION lib/cmake/RadRayDXC)
+write_basic_package_version_file(
+  ${CMAKE_BINARY_DIR}/RadRayDXCConfigVersion.cmake
+  VERSION 1.9.2607
+  COMPATIBILITY ExactVersion)
+install(FILES
+  ${CMAKE_BINARY_DIR}/RadRayDXCConfig.cmake
+  ${CMAKE_BINARY_DIR}/RadRayDXCConfigVersion.cmake
+  DESTINATION lib/cmake/RadRayDXC
+  COMPONENT dxc-headers)
+
 # The following only works with the Ninja generator in CMake >= 3.0.
 set(LLVM_PARALLEL_COMPILE_JOBS "" CACHE STRING
   "Define the maximum number of concurrent compilation jobs.")

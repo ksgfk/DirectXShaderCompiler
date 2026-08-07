@@ -13,10 +13,67 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace {
 
 using DxcCreateInstanceFn = HRESULT(WINAPI *)(REFCLSID, REFIID, LPVOID *);
+
+void AppendU16(std::vector<uint8_t> &bytes, uint16_t value) {
+  bytes.push_back(static_cast<uint8_t>(value));
+  bytes.push_back(static_cast<uint8_t>(value >> 8));
+}
+
+void AppendU32(std::vector<uint8_t> &bytes, uint32_t value) {
+  bytes.push_back(static_cast<uint8_t>(value));
+  bytes.push_back(static_cast<uint8_t>(value >> 8));
+  bytes.push_back(static_cast<uint8_t>(value >> 16));
+  bytes.push_back(static_cast<uint8_t>(value >> 24));
+}
+
+void AppendString(std::vector<uint8_t> &bytes, const char *value) {
+  const size_t size = std::strlen(value);
+  AppendU32(bytes, static_cast<uint32_t>(size));
+  bytes.insert(bytes.end(), value, value + size);
+}
+
+bool CheckDiscovery(radray::shader::IRadRayDxcCompiler *compiler) {
+  constexpr char source[] =
+      "[shader(\"vertex\")] float4 VSMain(float3 position : POSITION) : SV_Position {"
+      " return float4(position, 1.0); }\n";
+  std::vector<uint8_t> request;
+  AppendU32(request, radray::shader::kRadRayDxcDiscoveryWireMagic);
+  AppendU16(request, radray::shader::kRadRayDxcDiscoveryWireSchemaVersion);
+  AppendString(request, "probe.hlsl");
+  AppendU32(request, static_cast<uint32_t>(std::strlen(source)));
+  request.insert(request.end(), source, source + std::strlen(source));
+  request.push_back(static_cast<uint8_t>(radray::shader::RadRayDxcTarget::DXIL));
+
+  radray::shader::RadRayDxcBlobView input{
+      request.data(), static_cast<uint32_t>(request.size())};
+  radray::shader::IRadRayDxcResult *result = nullptr;
+  const HRESULT hr = compiler->DiscoverSourceContract(input, &result);
+  if (FAILED(hr) || result == nullptr) {
+    fwprintf(stderr, L"fork discovery call failed: 0x%08lx\n",
+             static_cast<unsigned long>(hr));
+    return false;
+  }
+  radray::shader::RadRayDxcCompileStatus status{};
+  radray::shader::RadRayDxcBlobView contract{};
+  const HRESULT statusHr = result->GetStatus(&status);
+  const HRESULT contractHr = result->GetContractBlob(&contract);
+  const bool valid = SUCCEEDED(statusHr) &&
+                     status == radray::shader::RadRayDxcCompileStatus::Success &&
+                     SUCCEEDED(contractHr) && contract.Data != nullptr &&
+                     contract.Size != 0;
+  if (!valid) {
+    fwprintf(stderr, L"fork discovery result is invalid: status=0x%08lx contract=0x%08lx\n",
+             static_cast<unsigned long>(statusHr),
+             static_cast<unsigned long>(contractHr));
+  }
+  result->Release();
+  return valid;
+}
 
 bool CheckFork(const wchar_t *path) {
   HMODULE module = LoadLibraryW(path);
@@ -55,6 +112,11 @@ bool CheckFork(const wchar_t *path) {
                      info.MetadataSchemaVersion ==
                          radray::shader::kRadRayDxcMetadataSchemaVersion &&
                      identityPresent;
+  if (valid && !CheckDiscovery(compiler)) {
+    compiler->Release();
+    FreeLibrary(module);
+    return false;
+  }
   compiler->Release();
   FreeLibrary(module);
   if (!valid) {

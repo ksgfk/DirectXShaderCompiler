@@ -27,6 +27,12 @@ inline constexpr IID IID_IRadRayDxcResult{
 
 inline constexpr uint32_t kRadRayDxcAbiVersion = 1;
 inline constexpr uint32_t kRadRayDxcMetadataSchemaVersion = 1;
+inline constexpr uint32_t kRadRayDxcShaderWireMagic = 0x59524452u;
+inline constexpr uint16_t kRadRayDxcShaderWireSchemaVersion = 1;
+inline constexpr uint32_t kRadRayDxcDiscoveryWireMagic = 0x44524452u;
+inline constexpr uint16_t kRadRayDxcDiscoveryWireSchemaVersion = 1;
+inline constexpr uint32_t kRadRayDxcContractWireMagic = 0x54434452u;
+inline constexpr uint16_t kRadRayDxcContractWireSchemaVersion = 1;
 
 enum class RadRayDxcTarget : uint32_t {
   DXIL = 0,
@@ -45,6 +51,7 @@ struct RadRayDxcHash128 {
 };
 
 struct RadRayDxcBlobView {
+  // The view remains valid until the owning IRadRayDxcResult is released.
   const uint8_t *Data{nullptr};
   uint32_t Size{0};
 };
@@ -58,6 +65,7 @@ struct RadRayDxcAbiInfo {
 };
 
 struct RadRayDxcLaneView {
+  // Both views are borrowed from the owning IRadRayDxcResult.
   RadRayDxcTarget Target{RadRayDxcTarget::DXIL};
   RadRayDxcBlobView Bytecode{};
   RadRayDxcBlobView Metadata{};
@@ -105,6 +113,9 @@ struct IRadRayDxcResult : public IUnknown {
 
   virtual HRESULT STDMETHODCALLTYPE GetTargetLane(
       _In_ RadRayDxcTarget target, _Out_ RadRayDxcLaneView *lane) = 0;
+
+  virtual HRESULT STDMETHODCALLTYPE
+  GetDiagnosticCount(_Out_ uint32_t *count) = 0;
 
   virtual HRESULT STDMETHODCALLTYPE GetDiagnostic(
       _In_ uint32_t index, _Out_ RadRayDxcDiagnosticView *diagnostic) = 0;

@@ -23,6 +23,7 @@ add_subdirectory(Tracing)
 set(DXC_PUBLIC_HEADERS
     ${CMAKE_CURRENT_BINARY_DIR}/config.h
     ${CMAKE_CURRENT_SOURCE_DIR}/dxcapi.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/dxcapi_radrayext.h
     ${CMAKE_CURRENT_SOURCE_DIR}/dxcerrors.h
     ${CMAKE_CURRENT_SOURCE_DIR}/dxcisense.h)
 
