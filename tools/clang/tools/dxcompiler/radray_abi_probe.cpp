@@ -157,11 +157,53 @@ bool CheckStockRejects(const wchar_t *path) {
   return rejected;
 }
 
+bool CheckWrongAbiRejects(const wchar_t *path) {
+  HMODULE module = LoadLibraryW(path);
+  if (module == nullptr) {
+    fwprintf(stderr, L"failed to load wrong-ABI DLL: %ls\n", path);
+    return false;
+  }
+
+  auto createInstance = reinterpret_cast<DxcCreateInstanceFn>(
+      GetProcAddress(module, "DxcCreateInstance"));
+  if (createInstance == nullptr) {
+    fwprintf(stderr, L"wrong-ABI DLL has no DxcCreateInstance: %ls\n", path);
+    FreeLibrary(module);
+    return false;
+  }
+
+  radray::shader::IRadRayDxcCompiler *compiler = nullptr;
+  const HRESULT hr = createInstance(
+      radray::shader::CLSID_RadRayDxcCompiler,
+      radray::shader::IID_IRadRayDxcCompiler,
+      reinterpret_cast<void **>(&compiler));
+  if (FAILED(hr) || compiler == nullptr) {
+    fwprintf(stderr, L"wrong-ABI DLL rejected its own CLSID: 0x%08lx\n",
+             static_cast<unsigned long>(hr));
+    FreeLibrary(module);
+    return false;
+  }
+
+  radray::shader::RadRayDxcAbiInfo info{};
+  const HRESULT abiHr = compiler->GetAbiInfo(&info);
+  const bool rejected = SUCCEEDED(abiHr) &&
+                        info.AbiVersion != radray::shader::kRadRayDxcAbiVersion;
+  compiler->Release();
+  FreeLibrary(module);
+  if (!rejected) {
+    fwprintf(stderr, L"wrong-ABI DLL unexpectedly matched the ABI\n");
+  }
+  return rejected;
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t **argv) {
+  if (argc == 3 && wcscmp(argv[1], L"--reject-wrong-abi") == 0)
+    return CheckWrongAbiRejects(argv[2]) ? 0 : 1;
   if (argc < 2 || argc > 3) {
     fwprintf(stderr, L"usage: radray_abi_probe <fork-dll> [stock-dll]\n");
+    fwprintf(stderr, L"       radray_abi_probe --reject-wrong-abi <dll>\n");
     return 2;
   }
   if (!CheckFork(argv[1]))

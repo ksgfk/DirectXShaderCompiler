@@ -84,7 +84,9 @@ set (HLSL_IGNORE_SOURCES
 )
 endif(WIN32)
 
-list(APPEND HLSL_IGNORE_SOURCES radray_abi_probe.cpp)
+list(APPEND HLSL_IGNORE_SOURCES
+  radray_abi_probe.cpp
+  radray_wrong_abi_fixture.cpp)
 
 set(LIBRARIES
   clangIndex
@@ -176,4 +178,11 @@ if (WIN32)
     ${LLVM_BINARY_DIR}/include
     ${LLVM_MAIN_INCLUDE_DIR})
   target_link_libraries(radray_dxc_abi_probe PRIVATE kernel32)
+
+  add_library(radray_wrong_abi_fixture SHARED EXCLUDE_FROM_ALL
+              radray_wrong_abi_fixture.cpp)
+  target_include_directories(radray_wrong_abi_fixture PRIVATE
+    ${LLVM_BINARY_DIR}/include
+    ${LLVM_MAIN_INCLUDE_DIR})
+  target_link_libraries(radray_wrong_abi_fixture PRIVATE kernel32)
 endif()
