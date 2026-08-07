@@ -585,6 +585,15 @@ struct MetadataRootConstantFact {
   uint32_t Flags{0};
 };
 
+struct MetadataVertexInputFact {
+  string Semantic;
+  uint32_t SemanticIndex{0};
+  uint32_t Location{0};
+  uint32_t ComponentType{0};
+  uint32_t ComponentCount{0};
+  uint32_t Flags{0};
+};
+
 struct MetadataRootBindingFact {
   uint32_t RegisterClass{0};
   uint32_t Binding{0};
@@ -595,6 +604,7 @@ struct MetadataFacts {
   vector<MetadataBindingFact> Bindings;
   vector<MetadataTypeFact> Types;
   vector<MetadataRootConstantFact> RootConstants;
+  vector<MetadataVertexInputFact> VertexInputs;
 };
 
 struct MetadataStructDecl {
@@ -1030,6 +1040,171 @@ vector<MetadataFieldDecl> ParseMetadataFields(string_view body) {
   return result;
 }
 
+struct MetadataVertexFieldDecl {
+  string Type;
+  string Semantic;
+  uint32_t SemanticIndex{0};
+};
+
+bool ParseMetadataSemantic(string_view text, string &semantic,
+                           uint32_t &semanticIndex) noexcept {
+  size_t cursor = 0;
+  semantic = MetadataReadIdentifier(Trim(text), cursor);
+  if (semantic.empty())
+    return false;
+  size_t suffix = semantic.size();
+  while (suffix != 0 &&
+         std::isdigit(static_cast<unsigned char>(semantic[suffix - 1])) != 0)
+    --suffix;
+  semanticIndex = 0;
+  for (size_t index = suffix; index < semantic.size(); ++index) {
+    semanticIndex = semanticIndex * 10u +
+                    static_cast<uint32_t>(semantic[index] - '0');
+  }
+  semantic.resize(suffix);
+  return !semantic.empty();
+}
+
+vector<MetadataVertexFieldDecl> ParseMetadataVertexFields(string_view body) {
+  vector<MetadataVertexFieldDecl> result;
+  size_t begin = 0;
+  while (begin < body.size()) {
+    const size_t end = body.find(';', begin);
+    const string_view statement = Trim(body.substr(
+        begin, end == string_view::npos ? body.size() - begin : end - begin));
+    begin = end == string_view::npos ? body.size() : end + 1;
+    const size_t colon = statement.find(':');
+    if (statement.empty() || colon == string_view::npos)
+      continue;
+    size_t cursor = 0;
+    const string type = MetadataReadIdentifier(statement.substr(0, colon), cursor);
+    if (type.empty())
+      continue;
+    const string semanticText = string{Trim(statement.substr(colon + 1))};
+    string semantic;
+    uint32_t semanticIndex = 0;
+    if (!ParseMetadataSemantic(semanticText, semantic, semanticIndex))
+      continue;
+    result.push_back({type, std::move(semantic), semanticIndex});
+  }
+  return result;
+}
+
+bool ParseMetadataVertexComponentShape(string_view type, uint32_t &componentType,
+                                       uint32_t &componentCount) noexcept {
+  string_view suffix;
+  if (StartsWith(type, "float") || StartsWith(type, "half")) {
+    componentType = 1;
+    suffix = StartsWith(type, "float") ? type.substr(5) : type.substr(4);
+  } else if (StartsWith(type, "int")) {
+    componentType = 2;
+    suffix = type.substr(3);
+  } else if (StartsWith(type, "uint")) {
+    componentType = 3;
+    suffix = type.substr(4);
+  } else {
+    return false;
+  }
+  if (suffix.empty()) {
+    componentCount = 1;
+    return true;
+  }
+  if (suffix.size() != 1 || suffix.front() < '1' || suffix.front() > '4')
+    return false;
+  componentCount = static_cast<uint32_t>(suffix.front() - '0');
+  return true;
+}
+
+bool BuildMetadataVertexInputs(string_view source,
+                               const ContractData &contract,
+                               MetadataFacts &facts,
+                               vector<Diagnostic> &diagnostics) {
+  const auto vertexEntry = std::find_if(
+      contract.EntryPoints.begin(), contract.EntryPoints.end(),
+      [](const EntryPoint &entry) noexcept {
+        return entry.Stage == ShaderStage::Vertex;
+      });
+  if (vertexEntry == contract.EntryPoints.end())
+    return true;
+
+  const size_t functionName = source.find(vertexEntry->Name);
+  const size_t open = functionName == string_view::npos
+                          ? string_view::npos
+                          : source.find('(', functionName + vertexEntry->Name.size());
+  if (open == string_view::npos) {
+    diagnostics.push_back({2107, "vertex entry input signature is unavailable"});
+    return false;
+  }
+  size_t close = open + 1;
+  uint32_t depth = 1;
+  for (; close < source.size() && depth != 0; ++close) {
+    if (source[close] == '(')
+      ++depth;
+    else if (source[close] == ')')
+      --depth;
+  }
+  if (depth != 0) {
+    diagnostics.push_back({2107, "vertex entry input signature is malformed"});
+    return false;
+  }
+
+  const vector<MetadataStructDecl> structs = ParseMetadataStructs(source);
+  const string_view parameters = source.substr(open + 1, close - open - 2);
+  uint32_t location = 0;
+  size_t begin = 0;
+  while (begin <= parameters.size()) {
+    const size_t end = parameters.find(',', begin);
+    const string_view parameter = Trim(parameters.substr(
+        begin, end == string_view::npos ? parameters.size() - begin : end - begin));
+    begin = end == string_view::npos ? parameters.size() + 1 : end + 1;
+    if (parameter.empty())
+      continue;
+
+    vector<MetadataVertexFieldDecl> fields;
+    if (parameter.find(':') != string_view::npos) {
+      string statement{parameter};
+      statement.push_back(';');
+      fields = ParseMetadataVertexFields(statement);
+    } else {
+      size_t cursor = 0;
+      const string type = MetadataReadIdentifier(parameter, cursor);
+      const auto structure = std::find_if(
+          structs.begin(), structs.end(),
+          [&](const MetadataStructDecl &value) noexcept {
+            return value.Name == type;
+          });
+      if (structure != structs.end())
+        fields = ParseMetadataVertexFields(structure->Body);
+    }
+
+    for (const MetadataVertexFieldDecl &field : fields) {
+      if (StartsWith(field.Semantic, "SV_"))
+        continue;
+      uint32_t componentType = 0;
+      uint32_t componentCount = 0;
+      if (!ParseMetadataVertexComponentShape(field.Type, componentType,
+                                              componentCount)) {
+        diagnostics.push_back({2107, "vertex input type is not representable"});
+        return false;
+      }
+      const auto duplicate = std::find_if(
+          facts.VertexInputs.begin(), facts.VertexInputs.end(),
+          [&](const MetadataVertexInputFact &value) noexcept {
+            return value.Semantic == field.Semantic &&
+                   value.SemanticIndex == field.SemanticIndex;
+          });
+      if (duplicate != facts.VertexInputs.end()) {
+        diagnostics.push_back({2108, "vertex input semantic is duplicated"});
+        return false;
+      }
+      facts.VertexInputs.push_back({field.Semantic, field.SemanticIndex,
+                                    location++, componentType, componentCount,
+                                    0});
+    }
+  }
+  return true;
+}
+
 MetadataLayoutInfo MetadataPrimitiveLayout(string_view type) noexcept {
   if (type == "float" || type == "int" || type == "uint" ||
       type == "bool")
@@ -1305,6 +1480,8 @@ bool BuildMetadataFacts(string_view source, const ContractData &contract,
         {2103, "shader source contains an invalid push/root constant declaration"});
     return false;
   }
+  if (!BuildMetadataVertexInputs(cleaned, contract, facts, diagnostics))
+    return false;
 
   vector<uint32_t> staticSamplerRegisters;
   size_t staticSamplerCursor = 0;
@@ -1748,6 +1925,7 @@ struct WireEnvelope {
   WireRange BindingRecords;
   WireRange TypeRecords;
   WireRange RootConstantRecords;
+  WireRange VertexInputRecords;
   WireRange Bytecode;
   uint64_t ToolchainIdentity;
   uint8_t Contract[16];
@@ -1796,13 +1974,23 @@ struct WireRootConstantRecord {
   uint32_t StageMask;
   uint32_t Flags;
 };
+
+struct WireVertexInputRecord {
+  WireRange Semantic;
+  uint32_t SemanticIndex;
+  uint32_t Location;
+  uint32_t ComponentType;
+  uint32_t ComponentCount;
+  uint32_t Flags;
+};
 #pragma pack(pop)
 
-static_assert(sizeof(WireEnvelope) == 144);
+static_assert(sizeof(WireEnvelope) == 152);
 static_assert(sizeof(WireEntryRecord) == 24);
 static_assert(sizeof(WireBindingRecord) == 32);
 static_assert(sizeof(WireTypeRecord) == 36);
 static_assert(sizeof(WireRootConstantRecord) == 24);
+static_assert(sizeof(WireVertexInputRecord) == 28);
 
 vector<uint8_t> EncodeCompileInput(const CompileRequest &request,
                                    RadRayDxcTarget target,
@@ -1866,7 +2054,10 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
   const uint32_t rootConstantOffset = typeOffset + typeBytes;
   const uint32_t rootConstantBytes = static_cast<uint32_t>(
       facts.RootConstants.size() * sizeof(WireRootConstantRecord));
-  const uint32_t nameOffset = rootConstantOffset + rootConstantBytes;
+  const uint32_t vertexInputOffset = rootConstantOffset + rootConstantBytes;
+  const uint32_t vertexInputBytes = static_cast<uint32_t>(
+      facts.VertexInputs.size() * sizeof(WireVertexInputRecord));
+  const uint32_t nameOffset = vertexInputOffset + vertexInputBytes;
   uint32_t nameBytes = 0;
   for (const EntryPoint &entry : contract.EntryPoints)
     nameBytes += static_cast<uint32_t>(entry.Name.size());
@@ -1874,6 +2065,8 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
     nameBytes += static_cast<uint32_t>(binding.Name.size());
   for (const MetadataTypeFact &type : facts.Types)
     nameBytes += static_cast<uint32_t>(type.Name.size());
+  for (const MetadataVertexInputFact &input : facts.VertexInputs)
+    nameBytes += static_cast<uint32_t>(input.Semantic.size());
   const uint32_t bytecodeOffset = nameOffset + nameBytes;
   uint32_t bytecodeSize = 0;
   for (const StageOutput &stage : stages)
@@ -1889,6 +2082,7 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
   envelope.BindingRecords = {bindingOffset, bindingBytes};
   envelope.TypeRecords = {typeOffset, typeBytes};
   envelope.RootConstantRecords = {rootConstantOffset, rootConstantBytes};
+  envelope.VertexInputRecords = {vertexInputOffset, vertexInputBytes};
   envelope.Bytecode = {bytecodeOffset, bytecodeSize};
   envelope.ToolchainIdentity = kMetadataToolchainIdentity;
   std::memcpy(envelope.Contract, contract.Hash.Bytes, sizeof(envelope.Contract));
@@ -1948,9 +2142,24 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
     rootConstants.push_back({fact.RegisterSpace, fact.Register, fact.Offset,
                              fact.Size, fact.StageMask, fact.Flags});
 
+  vector<WireVertexInputRecord> vertexInputs;
+  vertexInputs.reserve(facts.VertexInputs.size());
+  for (const MetadataVertexInputFact &fact : facts.VertexInputs) {
+    WireVertexInputRecord record{};
+    record.Semantic = {currentNameOffset,
+                       static_cast<uint32_t>(fact.Semantic.size())};
+    record.SemanticIndex = fact.SemanticIndex;
+    record.Location = fact.Location;
+    record.ComponentType = fact.ComponentType;
+    record.ComponentCount = fact.ComponentCount;
+    record.Flags = fact.Flags;
+    vertexInputs.push_back(record);
+    currentNameOffset += static_cast<uint32_t>(fact.Semantic.size());
+  }
+
   envelope.TotalSize = bytecodeOffset + bytecodeSize;
   vector<uint8_t> layoutBytes;
-  layoutBytes.reserve(bindingBytes + rootConstantBytes + nameBytes);
+  layoutBytes.reserve(bindingBytes + rootConstantBytes + vertexInputBytes + nameBytes);
   if (!bindings.empty()) {
     const auto *data = reinterpret_cast<const uint8_t *>(bindings.data());
     layoutBytes.insert(layoutBytes.end(), data, data + bindingBytes);
@@ -1959,12 +2168,18 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
     const auto *data = reinterpret_cast<const uint8_t *>(rootConstants.data());
     layoutBytes.insert(layoutBytes.end(), data, data + rootConstantBytes);
   }
+  if (!vertexInputs.empty()) {
+    const auto *data = reinterpret_cast<const uint8_t *>(vertexInputs.data());
+    layoutBytes.insert(layoutBytes.end(), data, data + vertexInputBytes);
+  }
   for (const EntryPoint &entry : contract.EntryPoints)
     layoutBytes.insert(layoutBytes.end(), entry.Name.begin(), entry.Name.end());
   for (const MetadataBindingFact &binding : facts.Bindings)
     layoutBytes.insert(layoutBytes.end(), binding.Name.begin(), binding.Name.end());
   for (const MetadataTypeFact &type : facts.Types)
     layoutBytes.insert(layoutBytes.end(), type.Name.begin(), type.Name.end());
+  for (const MetadataVertexInputFact &input : facts.VertexInputs)
+    layoutBytes.insert(layoutBytes.end(), input.Semantic.begin(), input.Semantic.end());
   const Hash128 bytecodeHash = [&]() {
     vector<uint8_t> bytes;
     bytes.reserve(bytecodeSize);
@@ -1993,6 +2208,9 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
   if (!rootConstants.empty())
     std::memcpy(metadata.data() + rootConstantOffset, rootConstants.data(),
                 rootConstantBytes);
+  if (!vertexInputs.empty())
+    std::memcpy(metadata.data() + vertexInputOffset, vertexInputs.data(),
+                vertexInputBytes);
   currentNameOffset = nameOffset;
   for (const EntryPoint &entry : contract.EntryPoints) {
     std::memcpy(metadata.data() + currentNameOffset, entry.Name.data(), entry.Name.size());
@@ -2007,6 +2225,11 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
     std::memcpy(metadata.data() + currentNameOffset, type.Name.data(),
                 type.Name.size());
     currentNameOffset += static_cast<uint32_t>(type.Name.size());
+  }
+  for (const MetadataVertexInputFact &input : facts.VertexInputs) {
+    std::memcpy(metadata.data() + currentNameOffset, input.Semantic.data(),
+                input.Semantic.size());
+    currentNameOffset += static_cast<uint32_t>(input.Semantic.size());
   }
   uint32_t currentBytecodeOffset = bytecodeOffset;
   for (const StageOutput &stage : stages) {
