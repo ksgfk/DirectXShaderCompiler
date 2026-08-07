@@ -585,6 +585,12 @@ struct MetadataRootConstantFact {
   uint32_t Flags{0};
 };
 
+struct MetadataRootBindingFact {
+  uint32_t RegisterClass{0};
+  uint32_t Binding{0};
+  uint32_t Group{0};
+};
+
 struct MetadataFacts {
   vector<MetadataBindingFact> Bindings;
   vector<MetadataTypeFact> Types;
@@ -767,6 +773,119 @@ string FindMetadataRootSignature(string_view source, size_t stageBegin) {
     cursor = open;
   }
   return {};
+}
+
+bool ParseMetadataRootBinding(string_view signature, size_t begin,
+                              string_view token,
+                              MetadataRootBindingFact &result) noexcept {
+  size_t cursor = begin + token.size();
+  cursor = MetadataSkipSpace(signature, cursor);
+  if (cursor >= signature.size() ||
+      (signature[cursor] != 'b' && signature[cursor] != 't' &&
+       signature[cursor] != 'u' && signature[cursor] != 's'))
+    return false;
+  switch (signature[cursor]) {
+  case 'b':
+    result.RegisterClass = 0;
+    break;
+  case 't':
+    result.RegisterClass = 1;
+    break;
+  case 'u':
+    result.RegisterClass = 2;
+    break;
+  case 's':
+    result.RegisterClass = 3;
+    break;
+  default:
+    return false;
+  }
+  ++cursor;
+  if (!MetadataParseUnsigned(signature, cursor, result.Binding))
+    return false;
+
+  const size_t close = signature.find(')', cursor);
+  if (close == string_view::npos)
+    return false;
+  const size_t space = signature.find("space", cursor);
+  if (space != string_view::npos && space < close) {
+    cursor = space + 5;
+    cursor = MetadataSkipSpace(signature, cursor);
+    if (cursor < close && signature[cursor] == '=')
+      ++cursor;
+    if (!MetadataParseUnsigned(signature, cursor, result.Group))
+      return false;
+  }
+  return true;
+}
+
+vector<MetadataRootBindingFact> ParseMetadataRootBindings(
+    string_view signature) {
+  vector<MetadataRootBindingFact> result;
+  constexpr string_view tokens[] = {
+      "CBV(", "SRV(", "UAV(", "Sampler(", "StaticSampler("};
+  for (const string_view token : tokens) {
+    size_t cursor = 0;
+    while ((cursor = signature.find(token, cursor)) != string_view::npos) {
+      MetadataRootBindingFact binding;
+      if (!ParseMetadataRootBinding(signature, cursor, token, binding))
+        return {};
+      result.push_back(binding);
+      cursor += token.size();
+    }
+  }
+  return result;
+}
+
+bool ValidateMetadataRootBindings(
+    string_view signature, const vector<MetadataBindingFact> &bindings,
+    vector<Diagnostic> &diagnostics) {
+  const vector<MetadataRootBindingFact> rootBindings =
+      ParseMetadataRootBindings(signature);
+  constexpr string_view tokens[] = {
+      "CBV(", "SRV(", "UAV(", "Sampler(", "StaticSampler("};
+  bool hasResourceToken = false;
+  for (const string_view token : tokens) {
+    if (signature.find(token) != string_view::npos) {
+      hasResourceToken = true;
+      break;
+    }
+  }
+  if (!hasResourceToken)
+    return bindings.empty();
+  if (rootBindings.empty() && !signature.empty()) {
+    diagnostics.push_back(
+        {2106, "DXIL RootSignature contains no parseable resource bindings"});
+    return false;
+  }
+
+  for (const MetadataBindingFact &binding : bindings) {
+    const auto found = std::find_if(
+        rootBindings.begin(), rootBindings.end(),
+        [&](const MetadataRootBindingFact &root) noexcept {
+          return root.RegisterClass == binding.RegisterClass &&
+                 root.Binding == binding.Binding && root.Group == binding.Group;
+        });
+    if (found == rootBindings.end()) {
+      diagnostics.push_back(
+          {2106, "DXIL RootSignature does not contain an active resource"});
+      return false;
+    }
+  }
+  for (const MetadataRootBindingFact &root : rootBindings) {
+    const auto found = std::find_if(
+        bindings.begin(), bindings.end(),
+        [&](const MetadataBindingFact &binding) noexcept {
+          return root.RegisterClass == binding.RegisterClass &&
+                 root.Binding == binding.Binding && root.Group == binding.Group;
+        });
+    if (found == bindings.end()) {
+      diagnostics.push_back(
+          {2106, "DXIL RootSignature contains an inactive resource"});
+      return false;
+    }
+  }
+  return true;
 }
 
 bool ParseMetadataResourceLine(string_view line, RadRayDxcTarget target,
@@ -1080,10 +1199,9 @@ bool BuildMetadataFacts(string_view source, const ContractData &contract,
     return false;
   }
 
-  if (contract.Kind == ShaderKind::Graphics &&
-      target == RadRayDxcTarget::DXIL) {
-    string explicitRootSignature;
-    bool hasExplicitRootSignature = false;
+  string explicitRootSignature;
+  bool hasExplicitRootSignature = false;
+  if (target == RadRayDxcTarget::DXIL) {
     for (const MetadataStageSpan &stage : stages) {
       const string signature = FindMetadataRootSignature(cleaned, stage.Begin);
       if (signature.empty())
@@ -1091,7 +1209,8 @@ bool BuildMetadataFacts(string_view source, const ContractData &contract,
       if (!hasExplicitRootSignature) {
         explicitRootSignature = signature;
         hasExplicitRootSignature = true;
-      } else if (signature != explicitRootSignature) {
+      } else if (contract.Kind == ShaderKind::Graphics &&
+                 signature != explicitRootSignature) {
         diagnostics.push_back(
             {2105, "graphics stages declare different RootSignature attributes"});
         return false;
@@ -1169,6 +1288,11 @@ bool BuildMetadataFacts(string_view source, const ContractData &contract,
     }
     facts.Bindings.push_back(std::move(declaration));
   }
+
+  if (hasExplicitRootSignature &&
+      !ValidateMetadataRootBindings(explicitRootSignature, facts.Bindings,
+                                    diagnostics))
+    return false;
 
   const vector<MetadataStructDecl> structs = ParseMetadataStructs(cleaned);
   vector<bool> visiting(structs.size(), false);
