@@ -7,7 +7,7 @@
 //                                                                           //
 ///////////////////////////////////////////////////////////////////////////////
 
-#include "dxc/Support/WinIncludes.h"
+#include <windows.h>
 #include "dxc/dxcapi_radrayext.h"
 
 #include <cstdint>
