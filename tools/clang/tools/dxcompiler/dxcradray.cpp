@@ -534,6 +534,7 @@ bool ParseKeywordPragma(string_view line, KeywordGroup &group) {
 }
 
 constexpr uint32_t kMetadataNoParent = 0xffffffffu;
+constexpr uint32_t kMetadataNoType = 0xffffffffu;
 
 enum class MetadataBindingKind : uint32_t {
   CBuffer = 1,
@@ -574,6 +575,8 @@ struct MetadataTypeFact {
   uint32_t Size{0};
   uint32_t Stride{0};
   uint32_t Flags{0};
+  uint32_t TypeIndex{kMetadataNoType};
+  string UnderlyingType;
 };
 
 struct MetadataRootConstantFact {
@@ -1268,7 +1271,8 @@ void AddMetadataTypeFacts(const vector<MetadataStructDecl> &structs,
   visiting[structIndex] = true;
   const uint32_t ownIndex = static_cast<uint32_t>(output.size());
   output.push_back({structs[structIndex].Name, parent,
-                    4u, 1u, 0u, layout.Size, layout.Size, 0u});
+                    4u, 1u, 0u, layout.Size, layout.Size, 0u,
+                    kMetadataNoType, {}});
   uint32_t offset = 0;
   for (const MetadataFieldDecl &field :
        ParseMetadataFields(structs[structIndex].Body)) {
@@ -1291,10 +1295,30 @@ void AddMetadataTypeFacts(const vector<MetadataStructDecl> &structs,
       kind = 5u;
     const uint32_t size = fieldLayout.Size * field.ArrayCount;
     output.push_back({field.Name, ownIndex, kind, field.ArrayCount, offset,
-                      size, fieldLayout.Size, 0u});
+                      size, fieldLayout.Size, 0u, kMetadataNoType, {}});
+    output.back().UnderlyingType = field.Type;
     offset += size;
   }
   visiting[structIndex] = false;
+}
+
+bool ResolveMetadataTypeIndices(vector<MetadataTypeFact> &types) {
+  for (MetadataTypeFact &type : types) {
+    if (type.UnderlyingType.empty())
+      continue;
+    const auto found = std::find_if(
+        types.begin(), types.end(),
+        [&](const MetadataTypeFact &candidate) noexcept {
+          return candidate.ParentIndex == kMetadataNoParent &&
+                 candidate.Kind == 4u && candidate.Name == type.UnderlyingType;
+        });
+    if (found != types.end()) {
+      type.TypeIndex = static_cast<uint32_t>(found - types.begin());
+    } else if (type.Kind == 4u) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool ParseMetadataRootConstants(string_view source,
@@ -1475,6 +1499,10 @@ bool BuildMetadataFacts(string_view source, const ContractData &contract,
   for (size_t index = 0; index < structs.size(); ++index)
     AddMetadataTypeFacts(structs, index, kMetadataNoParent, visiting, layouts,
                          facts.Types);
+  if (!ResolveMetadataTypeIndices(facts.Types)) {
+    diagnostics.push_back({2107, "metadata type tree contains an unresolved struct reference"});
+    return false;
+  }
   if (!ParseMetadataRootConstants(cleaned, stages, target, facts)) {
     diagnostics.push_back(
         {2103, "shader source contains an invalid push/root constant declaration"});
@@ -1964,6 +1992,7 @@ struct WireTypeRecord {
   uint32_t Size;
   uint32_t Stride;
   uint32_t Flags;
+  uint32_t TypeIndex;
 };
 
 struct WireRootConstantRecord {
@@ -1988,7 +2017,7 @@ struct WireVertexInputRecord {
 static_assert(sizeof(WireEnvelope) == 152);
 static_assert(sizeof(WireEntryRecord) == 24);
 static_assert(sizeof(WireBindingRecord) == 32);
-static_assert(sizeof(WireTypeRecord) == 36);
+static_assert(sizeof(WireTypeRecord) == 40);
 static_assert(sizeof(WireRootConstantRecord) == 24);
 static_assert(sizeof(WireVertexInputRecord) == 28);
 
@@ -2132,6 +2161,7 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
     record.Size = fact.Size;
     record.Stride = fact.Stride;
     record.Flags = fact.Flags;
+    record.TypeIndex = fact.TypeIndex;
     types.push_back(record);
     currentNameOffset += static_cast<uint32_t>(fact.Name.size());
   }

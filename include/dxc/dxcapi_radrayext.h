@@ -26,7 +26,7 @@ inline constexpr IID IID_IRadRayDxcResult{
     {0xb7, 0x6f, 0x4e, 0xd1, 0x58, 0x3b, 0x8a, 0x72}};
 
 inline constexpr uint32_t kRadRayDxcAbiVersion = 1;
-inline constexpr uint32_t kRadRayDxcMetadataSchemaVersion = 2;
+inline constexpr uint32_t kRadRayDxcMetadataSchemaVersion = 3;
 inline constexpr uint32_t kRadRayDxcShaderWireMagic = 0x59524452u;
 inline constexpr uint16_t kRadRayDxcShaderWireSchemaVersion = 1;
 inline constexpr uint32_t kRadRayDxcDiscoveryWireMagic = 0x44524452u;
