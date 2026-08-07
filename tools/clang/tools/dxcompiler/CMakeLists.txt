@@ -86,6 +86,7 @@ endif(WIN32)
 
 list(APPEND HLSL_IGNORE_SOURCES
   radray_abi_probe.cpp
+  radray_dxc_d3d12_smoke.cpp
   radray_wrong_abi_fixture.cpp)
 
 set(LIBRARIES
@@ -178,6 +179,21 @@ if (WIN32)
     ${LLVM_BINARY_DIR}/include
     ${LLVM_MAIN_INCLUDE_DIR})
   target_link_libraries(radray_dxc_abi_probe PRIVATE kernel32)
+
+  add_executable(radray_dxc_d3d12_smoke EXCLUDE_FROM_ALL
+                 radray_dxc_d3d12_smoke.cpp)
+  add_dependencies(radray_dxc_d3d12_smoke dxcompiler)
+  target_include_directories(radray_dxc_d3d12_smoke PRIVATE
+    ${LLVM_BINARY_DIR}/include
+    ${LLVM_MAIN_INCLUDE_DIR})
+  target_link_libraries(radray_dxc_d3d12_smoke PRIVATE
+    dxcompiler
+    d3d12
+    dxgi)
+  add_custom_command(TARGET radray_dxc_d3d12_smoke POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:dxcompiler>
+            $<TARGET_FILE_DIR:radray_dxc_d3d12_smoke>)
 
   add_library(radray_wrong_abi_fixture SHARED EXCLUDE_FROM_ALL
               radray_wrong_abi_fixture.cpp)
