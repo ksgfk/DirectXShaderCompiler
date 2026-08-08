@@ -20,4 +20,24 @@ if (NOT TARGET RadRayDXC::Compiler)
     INTERFACE_LINK_LIBRARIES RadRayDXC::Headers)
 endif()
 
+if (EXISTS "${PACKAGE_PREFIX_DIR}/bin/dxil.dll" AND
+    EXISTS "${PACKAGE_PREFIX_DIR}/lib/dxil.lib" AND
+    NOT TARGET RadRayDXC::Validator)
+  add_library(RadRayDXC::Validator SHARED IMPORTED)
+  set_target_properties(RadRayDXC::Validator PROPERTIES
+    IMPORTED_IMPLIB "${PACKAGE_PREFIX_DIR}/lib/dxil.lib"
+    IMPORTED_LOCATION "${PACKAGE_PREFIX_DIR}/bin/dxil.dll"
+    INTERFACE_LINK_LIBRARIES RadRayDXC::Headers)
+  set(RadRayDXC_Validator_FOUND TRUE)
+endif()
+
+if (EXISTS "${PACKAGE_PREFIX_DIR}/bin/dxc.exe" AND
+    NOT TARGET RadRayDXC::CLI)
+  add_executable(RadRayDXC::CLI IMPORTED)
+  set_target_properties(RadRayDXC::CLI PROPERTIES
+    IMPORTED_LOCATION "${PACKAGE_PREFIX_DIR}/bin/dxc.exe"
+    INTERFACE_LINK_LIBRARIES RadRayDXC::Compiler)
+  set(RadRayDXC_CLI_FOUND TRUE)
+endif()
+
 check_required_components(RadRayDXC)
