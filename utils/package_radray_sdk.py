@@ -41,7 +41,7 @@ from pathlib import Path
 
 DISTRIBUTION_COMPONENTS = ("dxc", "dxcompiler", "dxc-headers")
 BUILD_TARGETS = ("dxc", "dxcompiler", "dxildll")
-DEFAULT_VERSION = "1.9.2607+radray.1"
+DEFAULT_VERSION = "1.9.2607.radray.1"
 VERSION_RE = re.compile(r'set\(RADRAY_DXC_PACKAGE_VERSION\s+"([^"]+)"\)')
 
 
@@ -57,8 +57,8 @@ def read_package_version(repo_root: Path) -> str:
     return match.group(1)
 
 
-def archive_name(version: str, platform: str, arch: str) -> str:
-    return f"radray-dxc-{version}-{platform}-{arch}.zip"
+def archive_name(platform: str, arch: str) -> str:
+    return f"dxc-{platform}-{arch}.zip"
 
 
 def run(args: list[str], cwd: Path | None = None) -> None:
@@ -137,7 +137,7 @@ def main() -> int:
     version = args.version or read_package_version(repo_root)
     out_dir = args.out.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    archive_path = out_dir / archive_name(version, args.platform, args.arch)
+    archive_path = out_dir / archive_name(args.platform, args.arch)
 
     if not args.no_build:
         run(["cmake", "-B", str(build_dir)])

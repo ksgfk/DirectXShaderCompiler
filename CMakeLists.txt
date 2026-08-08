@@ -26,13 +26,14 @@ endif()
 project(LLVM)
 
 include(CMakePackageConfigHelpers)
-set(RADRAY_DXC_PACKAGE_VERSION "1.9.2607+radray.1")
+set(RADRAY_DXC_PACKAGE_VERSION "1.9.2607.radray.1")
 configure_package_config_file(
   ${CMAKE_SOURCE_DIR}/cmake/RadRayDXCConfig.cmake.in
   ${CMAKE_BINARY_DIR}/RadRayDXCConfig.cmake
   INSTALL_DESTINATION lib/cmake/RadRayDXC)
 write_basic_package_version_file(
   ${CMAKE_BINARY_DIR}/RadRayDXCConfigVersion.cmake
+  # CMake's version file remains numeric; RadRayDXCConfig.cmake exports the full package identity.
   VERSION 1.9.2607
   COMPATIBILITY ExactVersion)
 install(FILES
