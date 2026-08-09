@@ -360,7 +360,9 @@ TEST_F(DXIntellisenseTest, TUWhenRegionInactiveThenEndIsBeforeElseHash) {
   VERIFY_SUCCEEDED(result.TU->GetFile("filename.hlsl", &file));
   VERIFY_SUCCEEDED(result.TU->GetSkippedRanges(file.p, &resultCount, &results));
 
+#if defined(__cpp_exceptions) && !defined(NO_VERIFY_EXCEPTIONS)
   ::WEX::TestExecution::DisableVerifyExceptions disable;
+#endif
   VERIFY_ARE_EQUAL(1U, resultCount);
   for (unsigned i = 0; i < resultCount; ++i) {
     CComPtr<IDxcSourceLocation> endLoc;
@@ -390,7 +392,9 @@ TEST_F(DXIntellisenseTest, TUWhenRegionInactiveThenEndIsBeforeEndifHash) {
   VERIFY_SUCCEEDED(result.TU->GetFile("filename.hlsl", &file));
   VERIFY_SUCCEEDED(result.TU->GetSkippedRanges(file.p, &resultCount, &results));
 
+#if defined(__cpp_exceptions) && !defined(NO_VERIFY_EXCEPTIONS)
   ::WEX::TestExecution::DisableVerifyExceptions disable;
+#endif
   VERIFY_ARE_EQUAL(1U, resultCount);
   for (unsigned i = 0; i < resultCount; ++i) {
     CComPtr<IDxcSourceLocation> endLoc;
@@ -422,7 +426,9 @@ TEST_F(DXIntellisenseTest, TUWhenRegionInactiveThenStartIsAtIfdefEol) {
   VERIFY_SUCCEEDED(result.TU->GetFile("filename.hlsl", &file));
   VERIFY_SUCCEEDED(result.TU->GetSkippedRanges(file.p, &resultCount, &results));
 
+#if defined(__cpp_exceptions) && !defined(NO_VERIFY_EXCEPTIONS)
   ::WEX::TestExecution::DisableVerifyExceptions disable;
+#endif
   VERIFY_ARE_EQUAL(1U, resultCount);
   for (unsigned i = 0; i < resultCount; ++i) {
     CComPtr<IDxcSourceLocation> startLoc;

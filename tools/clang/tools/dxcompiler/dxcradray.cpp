@@ -470,7 +470,9 @@ struct MetadataFacts {
   vector<MetadataRootConstantFact> RootConstants;
   vector<MetadataVertexInputFact> VertexInputs;
   vector<MetadataRootBindingFact> RootBindings;
+  vector<MetadataRootBindingFact> StaticSamplerBindings;
   vector<string> StaticSamplerNames;
+  vector<uint8_t> SerializedRootSignature;
   Hash128 RootSignatureHash{};
   bool HasRootSignature{false};
   bool HasStaticSamplerPolicy{false};
@@ -657,6 +659,11 @@ public:
   }
 
   bool Finalize(ContractData &contract, vector<Diagnostic> &diagnostics) const;
+
+  bool AppendDiagnostics(vector<Diagnostic> &diagnostics) const {
+    diagnostics.insert(diagnostics.end(), _diagnostics.begin(), _diagnostics.end());
+    return _diagnostics.empty();
+  }
 
   const MetadataFacts &Metadata() const noexcept { return _metadata; }
   void CollectDxilModule(llvm::Module &module);
@@ -880,6 +887,10 @@ public:
 
   bool Finalize(ContractData &contract, vector<Diagnostic> &diagnostics) const {
     return _collector.Finalize(contract, diagnostics);
+  }
+
+  bool AppendDiagnostics(vector<Diagnostic> &diagnostics) const {
+    return _collector.AppendDiagnostics(diagnostics);
   }
 
   const MetadataFacts &Metadata() const noexcept { return _collector.Metadata(); }
@@ -1497,6 +1508,18 @@ void ValidateDxilRootSignature(const hlsl::DxilVersionedRootSignatureDesc &root,
   }
   facts.HasStaticSamplerPolicy = !staticSamplerBindings.empty();
 
+  for (const MetadataRootBindingFact &staticSampler : staticSamplerBindings) {
+    const auto found = std::find_if(
+        facts.StaticSamplerBindings.begin(), facts.StaticSamplerBindings.end(),
+        [&](const MetadataRootBindingFact &value) noexcept {
+          return value.RegisterClass == staticSampler.RegisterClass &&
+                 value.Group == staticSampler.Group &&
+                 value.Binding == staticSampler.Binding;
+        });
+    if (found == facts.StaticSamplerBindings.end())
+      facts.StaticSamplerBindings.push_back(staticSampler);
+  }
+
   for (const MetadataRootBindingFact &rootBinding : rootBindings) {
     const auto found = std::find_if(
         facts.RootBindings.begin(), facts.RootBindings.end(),
@@ -2018,6 +2041,7 @@ bool CollectContractWithFrontend(
 
 struct StageOutput {
   vector<uint8_t> Bytecode;
+  vector<uint8_t> RootSignature;
   MetadataFacts Facts;
 };
 
@@ -2093,6 +2117,8 @@ bool CompileStage(const CompileRequest &request, RadRayDxcTarget target,
     argumentStorage.emplace_back(L"-Zi");
   if (request.AllResourcesBound != 0)
     argumentStorage.emplace_back(L"-all_resources_bound");
+  if (target == RadRayDxcTarget::DXIL)
+    argumentStorage.emplace_back(L"-Qstrip_rootsignature");
   if (target == RadRayDxcTarget::SPIRV) {
     argumentStorage.emplace_back(L"-spirv");
     argumentStorage.emplace_back(L"-fspv-target-env=vulkan1.2");
@@ -2170,6 +2196,26 @@ bool CompileStage(const CompileRequest &request, RadRayDxcTarget target,
   output.Bytecode.assign(data, data + object->GetBufferSize());
 
   output.Facts = observer.Metadata();
+  if (!observer.AppendDiagnostics(diagnostics))
+    return false;
+  if (target == RadRayDxcTarget::DXIL) {
+    CComPtr<IDxcBlob> rootSignature;
+    if (SUCCEEDED(result->GetOutput(
+            DXC_OUT_ROOT_SIGNATURE, IID_PPV_ARGS(&rootSignature), nullptr)) &&
+        rootSignature != nullptr && rootSignature->GetBufferSize() != 0) {
+      const auto *rootData = static_cast<const uint8_t *>(
+          rootSignature->GetBufferPointer());
+      output.RootSignature.assign(
+          rootData, rootData + rootSignature->GetBufferSize());
+    }
+    if (output.Facts.HasRootSignature != !output.RootSignature.empty()) {
+      diagnostics.push_back({
+          2106,
+          "DXIL RootSignature observer state does not match DXC output"});
+      return false;
+    }
+    output.Facts.SerializedRootSignature = output.RootSignature;
+  }
   if (target == RadRayDxcTarget::SPIRV) {
     MetadataFacts dxilRootPolicy;
     const bool hasRootPolicy =
@@ -2217,6 +2263,7 @@ struct WireEnvelope {
   WireRange TypeRecords;
   WireRange RootConstantRecords;
   WireRange VertexInputRecords;
+  WireRange RootSignature;
   WireRange Bytecode;
   uint64_t ToolchainIdentity;
   uint8_t Contract[16];
@@ -2276,7 +2323,7 @@ struct WireVertexInputRecord {
 };
 #pragma pack(pop)
 
-static_assert(sizeof(WireEnvelope) == 136);
+static_assert(sizeof(WireEnvelope) == 144);
 static_assert(sizeof(WireEntryRecord) == 24);
 static_assert(sizeof(WireBindingRecord) == 32);
 static_assert(sizeof(WireTypeRecord) == 40);
@@ -2299,15 +2346,32 @@ bool MergeMetadataFacts(const ContractData &contract,
             facts.StaticSamplerNames.end())
           facts.StaticSamplerNames.push_back(name);
     }
+    for (const MetadataRootBindingFact &staticSampler : source.StaticSamplerBindings) {
+      const auto found = std::find_if(
+          facts.StaticSamplerBindings.begin(), facts.StaticSamplerBindings.end(),
+          [&](const MetadataRootBindingFact &value) noexcept {
+            return value.RegisterClass == staticSampler.RegisterClass &&
+                   value.Group == staticSampler.Group &&
+                   value.Binding == staticSampler.Binding;
+          });
+      if (found == facts.StaticSamplerBindings.end())
+        facts.StaticSamplerBindings.push_back(staticSampler);
+    }
     if (source.HasRootSignature) {
+      if (source.SerializedRootSignature.empty()) {
+        diagnostics.push_back({
+            2106, "DXIL RootSignature metadata has no serialized output"});
+        return false;
+      }
       if (facts.HasRootSignature &&
-          !(facts.RootSignatureHash == source.RootSignatureHash)) {
+          facts.SerializedRootSignature != source.SerializedRootSignature) {
         diagnostics.push_back(
             {2105, "graphics stages declare different RootSignature attributes"});
         return false;
       }
       facts.HasRootSignature = true;
       facts.RootSignatureHash = source.RootSignatureHash;
+      facts.SerializedRootSignature = source.SerializedRootSignature;
     }
 
     for (const MetadataRootBindingFact &rootBinding : source.RootBindings) {
@@ -2414,25 +2478,24 @@ bool MergeMetadataFacts(const ContractData &contract,
   }
   if (target == RadRayDxcTarget::DXIL && facts.HasRootSignature) {
     const auto hasRootBinding = [](const MetadataRootBindingFact &rootBinding,
-                                   const MetadataBindingFact &binding) noexcept {
+                                   const MetadataBindingFact &binding,
+                                   uint32_t arrayElement = 0) noexcept {
       return rootBinding.RegisterClass == binding.RegisterClass &&
              rootBinding.Group == binding.Group &&
-             rootBinding.Binding == binding.Binding;
+             arrayElement <= std::numeric_limits<uint32_t>::max() - binding.Binding &&
+             rootBinding.Binding == binding.Binding + arrayElement;
     };
-    const bool hasNonSamplerRootBinding = std::any_of(
-        facts.RootBindings.begin(), facts.RootBindings.end(),
-        [](const MetadataRootBindingFact &rootBinding) noexcept {
-          return rootBinding.RegisterClass != 3u;
-        });
-    if (hasNonSamplerRootBinding) {
-      for (const MetadataBindingFact &binding : facts.Bindings) {
-        if (!binding.HasExplicitBinding &&
-            binding.Type != static_cast<uint32_t>(MetadataBindingKind::Sampler))
-          continue;
+    for (const MetadataBindingFact &binding : facts.Bindings) {
+      if (binding.Count == 0 || binding.Count > kMaxCollectionCount) {
+        diagnostics.push_back(
+            {2106, "DXIL RootSignature active resource array is unsupported"});
+        return false;
+      }
+      for (uint32_t arrayElement = 0; arrayElement < binding.Count; ++arrayElement) {
         const auto found = std::find_if(
             facts.RootBindings.begin(), facts.RootBindings.end(),
             [&](const MetadataRootBindingFact &rootBinding) noexcept {
-              return hasRootBinding(rootBinding, binding);
+              return hasRootBinding(rootBinding, binding, arrayElement);
             });
         if (found == facts.RootBindings.end()) {
           diagnostics.push_back(
@@ -2443,23 +2506,12 @@ bool MergeMetadataFacts(const ContractData &contract,
     }
     for (MetadataBindingFact &binding : facts.Bindings)
       if (binding.Type == static_cast<uint32_t>(MetadataBindingKind::Sampler) &&
-          std::any_of(facts.RootBindings.begin(), facts.RootBindings.end(),
+          std::any_of(facts.StaticSamplerBindings.begin(),
+                      facts.StaticSamplerBindings.end(),
                       [&](const MetadataRootBindingFact &rootBinding) noexcept {
                         return hasRootBinding(rootBinding, binding);
                       }))
         binding.Flags |= kMetadataImmutableSampler;
-    for (const MetadataRootBindingFact &rootBinding : facts.RootBindings) {
-      const auto found = std::find_if(
-          facts.Bindings.begin(), facts.Bindings.end(),
-          [&](const MetadataBindingFact &binding) noexcept {
-            return hasRootBinding(rootBinding, binding);
-          });
-      if (found == facts.Bindings.end()) {
-        diagnostics.push_back(
-            {2106, "DXIL RootSignature contains an inactive resource"});
-        return false;
-      }
-    }
   }
   for (MetadataRootConstantFact &constant : facts.RootConstants)
     constant.StageMask &= 0x7u;
@@ -2505,7 +2557,10 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
     nameBytes += static_cast<uint32_t>(type.Name.size());
   for (const MetadataVertexInputFact &input : facts.VertexInputs)
     nameBytes += static_cast<uint32_t>(input.Semantic.size());
-  const uint32_t bytecodeOffset = nameOffset + nameBytes;
+  const uint32_t rootSignatureOffset = nameOffset + nameBytes;
+  const uint32_t rootSignatureSize = static_cast<uint32_t>(
+      facts.SerializedRootSignature.size());
+  const uint32_t bytecodeOffset = rootSignatureOffset + rootSignatureSize;
   uint32_t bytecodeSize = 0;
   for (const StageOutput &stage : stages)
     bytecodeSize += static_cast<uint32_t>(stage.Bytecode.size());
@@ -2521,6 +2576,7 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
   envelope.TypeRecords = {typeOffset, typeBytes};
   envelope.RootConstantRecords = {rootConstantOffset, rootConstantBytes};
   envelope.VertexInputRecords = {vertexInputOffset, vertexInputBytes};
+  envelope.RootSignature = {rootSignatureOffset, rootSignatureSize};
   envelope.Bytecode = {bytecodeOffset, bytecodeSize};
   envelope.ToolchainIdentity = kMetadataToolchainIdentity;
   std::memcpy(envelope.Contract, contract.Hash.Bytes, sizeof(envelope.Contract));
@@ -2598,6 +2654,10 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
   envelope.TotalSize = bytecodeOffset + bytecodeSize;
   vector<uint8_t> layoutBytes;
   layoutBytes.reserve(bindingBytes + rootConstantBytes + vertexInputBytes + nameBytes);
+  AppendByte(layoutBytes, facts.HasRootSignature ? 1u : 0u);
+  if (facts.HasRootSignature)
+    for (const uint8_t value : facts.RootSignatureHash.Bytes)
+      AppendByte(layoutBytes, value);
   if (!bindings.empty()) {
     const auto *data = reinterpret_cast<const uint8_t *>(bindings.data());
     layoutBytes.insert(layoutBytes.end(), data, data + bindingBytes);
@@ -2668,6 +2728,11 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
     std::memcpy(metadata.data() + currentNameOffset, input.Semantic.data(),
                 input.Semantic.size());
     currentNameOffset += static_cast<uint32_t>(input.Semantic.size());
+  }
+  if (!facts.SerializedRootSignature.empty()) {
+    std::memcpy(metadata.data() + rootSignatureOffset,
+                facts.SerializedRootSignature.data(),
+                facts.SerializedRootSignature.size());
   }
   uint32_t currentBytecodeOffset = bytecodeOffset;
   for (const StageOutput &stage : stages) {
