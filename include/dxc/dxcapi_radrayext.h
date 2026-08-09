@@ -14,10 +14,10 @@ inline constexpr CLSID CLSID_RadRayDxcCompiler{
     {0x9a, 0x1b, 0x7c, 0x22, 0x91, 0x55, 0xb4, 0x10}};
 
 inline constexpr IID IID_IRadRayDxcCompiler{
-    0x2e0b6f43,
-    0x0e5b,
-    0x4f2d,
-    {0x8c, 0x7b, 0x38, 0x4e, 0x7b, 0x11, 0x7f, 0x20}};
+    0x3f5c7a84,
+    0x1f6c,
+    0x5a3e,
+    {0x9d, 0x8c, 0x49, 0x5f, 0x8c, 0x22, 0x80, 0x31}};
 
 inline constexpr IID IID_IRadRayDxcResult{
     0x51b1f89a,
@@ -25,12 +25,12 @@ inline constexpr IID IID_IRadRayDxcResult{
     0x47c2,
     {0xb7, 0x6f, 0x4e, 0xd1, 0x58, 0x3b, 0x8a, 0x72}};
 
-inline constexpr uint32_t kRadRayDxcAbiVersion = 1;
-inline constexpr uint32_t kRadRayDxcMetadataSchemaVersion = 3;
+inline constexpr uint32_t kRadRayDxcAbiVersion = 2;
+inline constexpr uint32_t kRadRayDxcMetadataSchemaVersion = 4;
 inline constexpr uint32_t kRadRayDxcShaderWireMagic = 0x59524452u;
-inline constexpr uint16_t kRadRayDxcShaderWireSchemaVersion = 1;
+inline constexpr uint16_t kRadRayDxcShaderWireSchemaVersion = 2;
 inline constexpr uint32_t kRadRayDxcDiscoveryWireMagic = 0x44524452u;
-inline constexpr uint16_t kRadRayDxcDiscoveryWireSchemaVersion = 1;
+inline constexpr uint16_t kRadRayDxcDiscoveryWireSchemaVersion = 3;
 inline constexpr uint32_t kRadRayDxcContractWireMagic = 0x54434452u;
 inline constexpr uint16_t kRadRayDxcContractWireSchemaVersion = 1;
 
@@ -56,6 +56,12 @@ struct RadRayDxcBlobView {
   uint32_t Size{0};
 };
 
+struct RadRayDxcIncludePathListView {
+  // Each element is an explicitly sized UTF-8 path borrowed for one synchronous call.
+  const RadRayDxcBlobView *Paths{nullptr};
+  uint32_t Count{0};
+};
+
 struct RadRayDxcAbiInfo {
   uint32_t AbiVersion{kRadRayDxcAbiVersion};
   uint32_t MetadataSchemaVersion{kRadRayDxcMetadataSchemaVersion};
@@ -78,6 +84,7 @@ struct RadRayDxcDiagnosticView {
 
 static_assert(sizeof(RadRayDxcHash128) == 16);
 static_assert(sizeof(RadRayDxcBlobView) == 16);
+static_assert(sizeof(RadRayDxcIncludePathListView) == 16);
 static_assert(sizeof(RadRayDxcAbiInfo) == 32);
 static_assert(sizeof(RadRayDxcLaneView) == 40);
 static_assert(sizeof(RadRayDxcDiagnosticView) == 24);
@@ -85,17 +92,19 @@ static_assert(sizeof(RadRayDxcDiagnosticView) == 24);
 struct IRadRayDxcResult;
 
 CROSS_PLATFORM_UUIDOF(IRadRayDxcCompiler,
-                       "2E0B6F43-0E5B-4F2D-8C7B-384E7B117F20")
+                       "3F5C7A84-1F6C-5A3E-9D8C-495F8C228031")
 struct IRadRayDxcCompiler : public IUnknown {
   virtual HRESULT STDMETHODCALLTYPE
   GetAbiInfo(_Out_ RadRayDxcAbiInfo *info) = 0;
 
   virtual HRESULT STDMETHODCALLTYPE DiscoverSourceContract(
       _In_ RadRayDxcBlobView request,
+      _In_ RadRayDxcIncludePathListView includePaths,
       _COM_Outptr_ IRadRayDxcResult **result) = 0;
 
   virtual HRESULT STDMETHODCALLTYPE CompileVariant(
       _In_ RadRayDxcBlobView request,
+      _In_ RadRayDxcIncludePathListView includePaths,
       _COM_Outptr_ IRadRayDxcResult **result) = 0;
 };
 

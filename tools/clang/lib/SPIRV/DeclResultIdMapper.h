@@ -479,6 +479,16 @@ public:
   SpirvInstruction *getDeclEvalInfo(const ValueDecl *decl, SourceLocation loc,
                                     SourceRange range = {});
 
+  /// \brief Returns the instruction for a decl if it has already been
+  /// registered, without creating a lazy declaration.
+  ///
+  /// This is used by compiler-owned semantic observers that need to relate an
+  /// AST reference to the final SPIR-V instruction model.
+  SpirvInstruction *getDeclEvalInfoIfRegistered(const ValueDecl *decl) const {
+    const DeclSpirvInfo *info = getDeclSpirvInfo(decl);
+    return info != nullptr ? info->instr : nullptr;
+  }
+
   /// \brief Returns the instruction pointer for the given function if already
   /// registered; otherwise, treats the given function as a normal decl and
   /// returns a newly created instruction for it.

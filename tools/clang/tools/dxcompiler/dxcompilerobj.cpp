@@ -54,6 +54,7 @@
 #include "dxcetw.h"
 #endif
 #include "dxcompileradapter.h"
+#include "dxcompilerobj_radray.h"
 #include "dxcshadersourceinfo.h"
 #include "dxcversion.inc"
 #include <algorithm>
@@ -522,6 +523,19 @@ public:
                                            // #include directives (optional)
       REFIID riid, LPVOID *ppResult // IDxcResult: status, buffer, and errors
       ) override {
+    return CompileWithRadRayObserver(
+        pSource, pArguments, argCount, pIncludeHandler, nullptr, riid,
+        ppResult);
+  }
+
+  HRESULT CompileWithRadRayObserver(
+      const DxcBuffer *pSource,
+      LPCWSTR *pArguments,
+      UINT32 argCount,
+      IDxcIncludeHandler *pIncludeHandler,
+      RadRayCompilerObserver *observer,
+      REFIID riid,
+      LPVOID *ppResult) {
     llvm::TimeTraceScope TimeScope("Compile", StringRef(""));
     if (pSource == nullptr || ppResult == nullptr ||
         (argCount > 0 && pArguments == nullptr))
@@ -857,7 +871,16 @@ public:
 
       compiler.getTarget().adjust(compiler.getLangOpts());
 
-      if (opts.AstDump) {
+      if (observer && observer->UseSyntaxOnly()) {
+        std::unique_ptr<FrontendAction> action =
+            std::make_unique<SyntaxOnlyAction>();
+        action = observer->WrapAction(std::move(action));
+        FrontendInputFile file(pUtf8SourceName, IK_HLSL);
+        if (action->BeginSourceFile(compiler, file)) {
+          action->Execute();
+          action->EndSourceFile();
+        }
+      } else if (opts.AstDump) {
         TimeTraceScope TimeScope("DumpAST", StringRef(""));
         clang::ASTDumpAction dumpAction;
         // Consider - ASTDumpFilter, ASTDumpLookups
@@ -928,11 +951,14 @@ public:
           }
         }
       } else if (opts.VerifyDiagnostics) {
-        SyntaxOnlyAction action;
+        std::unique_ptr<FrontendAction> action =
+            std::make_unique<SyntaxOnlyAction>();
+        if (observer)
+          action = observer->WrapAction(std::move(action));
         FrontendInputFile file(pUtf8SourceName, IK_HLSL);
-        if (action.BeginSourceFile(compiler, file)) {
-          action.Execute();
-          action.EndSourceFile();
+        if (action->BeginSourceFile(compiler, file)) {
+          action->Execute();
+          action->EndSourceFile();
         }
       }
       // SPIRV change starts
@@ -958,23 +984,33 @@ public:
         }
 
         compiler.getCodeGenOpts().SpirvOptions = opts.SpirvOptions;
-        clang::EmitSpirvAction action;
+        auto action = std::make_unique<clang::EmitSpirvAction>();
+        clang::EmitSpirvAction *spirvAction = action.get();
+        std::unique_ptr<FrontendAction> frontendAction = std::move(action);
+        if (observer)
+          frontendAction = observer->WrapAction(std::move(frontendAction));
         FrontendInputFile file(pUtf8SourceName, IK_HLSL);
-        action.BeginSourceFile(compiler, file);
-        action.Execute();
-        action.EndSourceFile();
+        frontendAction->BeginSourceFile(compiler, file);
+        frontendAction->Execute();
+        if (observer)
+          observer->OnSpirvActionComplete(*spirvAction);
+        frontendAction->EndSourceFile();
         outStream.flush();
       }
 #endif
       // SPIRV change ends
       else if (!isPreprocessing) {
-        EmitBCAction action(&llvmContext);
+        auto action = std::make_unique<EmitBCAction>(&llvmContext);
+        CodeGenAction *codeGenAction = action.get();
+        std::unique_ptr<FrontendAction> frontendAction = std::move(action);
+        if (observer)
+          frontendAction = observer->WrapAction(std::move(frontendAction));
         FrontendInputFile file(pUtf8SourceName, IK_HLSL);
         bool compileOK;
         TimeTraceScope TimeScope("Compile Action", StringRef(""));
-        if (action.BeginSourceFile(compiler, file)) {
-          action.Execute();
-          action.EndSourceFile();
+        if (frontendAction->BeginSourceFile(compiler, file)) {
+          frontendAction->Execute();
+          frontendAction->EndSourceFile();
           compileOK = !compiler.getDiagnostics().hasErrorOccurred();
         } else {
           compileOK = false;
@@ -1033,7 +1069,11 @@ public:
                                  &pReflectionStream));
           IFT(CreateMemoryStream(DxcGetThreadMallocNoRef(), &pRootSigStream));
 
-          std::unique_ptr<llvm::Module> serializeModule(action.takeModule());
+          std::unique_ptr<llvm::Module> serializeModule(
+              codeGenAction->takeModule());
+
+          if (observer && serializeModule)
+            observer->OnDxilModule(*serializeModule);
 
           // Clone and save the copy.
           if (opts.GenerateFullDebugInfo()) {
@@ -2036,4 +2076,23 @@ HRESULT CreateDxcCompiler(REFIID riid, LPVOID *ppv) {
     return result.p->QueryInterface(riid, ppv);
   }
   CATCH_CPP_RETURN_HRESULT();
+}
+
+HRESULT CompileDxcWithRadRayObserver(
+    const DxcBuffer *source,
+    LPCWSTR *arguments,
+    UINT32 argumentCount,
+    IDxcIncludeHandler *includeHandler,
+    RadRayCompilerObserver *observer,
+    REFIID resultIid,
+    LPVOID *result) {
+  if (observer == nullptr || result == nullptr)
+    return E_INVALIDARG;
+  *result = nullptr;
+  CComPtr<DxcCompiler> compiler(
+      DxcCompiler::Alloc(DxcGetThreadMallocNoRef()));
+  IFROOM(compiler.p);
+  return compiler->CompileWithRadRayObserver(
+      source, arguments, argumentCount, includeHandler, observer, resultIid,
+      result);
 }

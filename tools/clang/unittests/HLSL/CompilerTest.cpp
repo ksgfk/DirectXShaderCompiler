@@ -24,10 +24,13 @@
 #include <sstream>
 #include <algorithm>
 #include <cfloat>
+#include <cstdint>
+#include <cstring>
 #include "dxc/DxilContainer/DxilContainer.h"
 #include "dxc/Support/WinIncludes.h"
 #include "dxc/Support/D3DReflection.h"
 #include "dxc/dxcapi.h"
+#include "dxc/dxcapi_radrayext.h"
 #ifdef _WIN32
 #include "dxc/dxcpix.h"
 #include <atlfile.h>
@@ -75,6 +78,56 @@
 
 using namespace std;
 using namespace hlsl_test;
+
+static void AppendRadRayU32(vector<uint8_t> &bytes, uint32_t value) {
+  bytes.push_back(static_cast<uint8_t>(value));
+  bytes.push_back(static_cast<uint8_t>(value >> 8));
+  bytes.push_back(static_cast<uint8_t>(value >> 16));
+  bytes.push_back(static_cast<uint8_t>(value >> 24));
+}
+
+static void AppendRadRayU16(vector<uint8_t> &bytes, uint16_t value) {
+  bytes.push_back(static_cast<uint8_t>(value));
+  bytes.push_back(static_cast<uint8_t>(value >> 8));
+}
+
+static void AppendRadRayString(vector<uint8_t> &bytes, const char *value) {
+  const size_t size = strlen(value);
+  AppendRadRayU32(bytes, static_cast<uint32_t>(size));
+  bytes.insert(bytes.end(), value, value + size);
+}
+
+static vector<uint8_t> MakeRadRayDiscoveryRequest() {
+  static constexpr char source[] = R"hlsl(
+#if !defined(RADRAY_TEST_DEFINE)
+#error RADRAY_TEST_DEFINE was not provided
+#endif
+[shader("vertex")]
+float4 VSMain(float3 position : POSITION) : SV_Position {
+  return float4(position, 1.0);
+}
+)hlsl";
+
+  vector<uint8_t> bytes;
+  AppendRadRayU32(bytes, radray::shader::kRadRayDxcDiscoveryWireMagic);
+  AppendRadRayU16(bytes, radray::shader::kRadRayDxcDiscoveryWireSchemaVersion);
+  AppendRadRayString(bytes, "radray_extension_test.hlsl");
+  AppendRadRayU32(bytes, static_cast<uint32_t>(sizeof(source) - 1));
+  bytes.insert(bytes.end(), source, source + sizeof(source) - 1);
+  bytes.push_back(1u); // DXIL target mask.
+  AppendRadRayU32(bytes, 60u);
+  bytes.push_back(1u); // Optimize.
+  bytes.push_back(0u); // DebugInfo.
+  bytes.push_back(0u); // AllResourcesBound.
+  bytes.push_back(0u); // WarningPolicy::Default.
+  AppendRadRayU32(bytes, 0u); // Vulkan 1.2.
+  AppendRadRayU32(bytes, 2021u);
+  AppendRadRayU32(bytes, 0u); // Reserved.
+  AppendRadRayU32(bytes, 1u);
+  AppendRadRayString(bytes, "RADRAY_TEST_DEFINE");
+  AppendRadRayString(bytes, "1");
+  return bytes;
+}
 
 class TestIncludeHandler : public IDxcIncludeHandler {
   DXC_MICROCOM_REF_FIELD(m_dwRef)
@@ -149,6 +202,7 @@ public:
 
   TEST_METHOD(CompileWhenDefinesThenApplied)
   TEST_METHOD(CompileWhenDefinesManyThenApplied)
+  TEST_METHOD(RadRayExtensionAbiAndDiscovery)
   TEST_METHOD(CompileWhenEmptyThenFails)
   TEST_METHOD(CompileWhenIncorrectThenFails)
   TEST_METHOD(CompileWhenWorksThenDisassembleWorks)
@@ -763,6 +817,42 @@ bool CompilerTest::InitSupport() {
     m_ver.Initialize(m_dllSupport);
   }
   return true;
+}
+
+TEST_F(CompilerTest, RadRayExtensionAbiAndDiscovery) {
+  CComPtr<radray::shader::IRadRayDxcCompiler> compiler;
+  VERIFY_SUCCEEDED(DxcCreateInstance(
+      radray::shader::CLSID_RadRayDxcCompiler,
+      IID_PPV_ARGS(&compiler)));
+
+  radray::shader::RadRayDxcAbiInfo abi{};
+  VERIFY_SUCCEEDED(compiler->GetAbiInfo(&abi));
+  VERIFY_ARE_EQUAL(radray::shader::kRadRayDxcAbiVersion, abi.AbiVersion);
+  VERIFY_ARE_EQUAL(radray::shader::kRadRayDxcMetadataSchemaVersion,
+                   abi.MetadataSchemaVersion);
+  VERIFY_ARE_EQUAL(1u, abi.ToolchainMajor);
+  VERIFY_ARE_EQUAL(9u, abi.ToolchainMinor);
+  bool hasIdentity = false;
+  for (const uint8_t value : abi.ToolchainIdentity.Bytes)
+    hasIdentity |= value != 0;
+  VERIFY_IS_TRUE(hasIdentity);
+
+  const vector<uint8_t> requestBytes = MakeRadRayDiscoveryRequest();
+  const radray::shader::RadRayDxcBlobView request{
+      requestBytes.data(), static_cast<uint32_t>(requestBytes.size())};
+  radray::shader::IRadRayDxcResult *rawResult = nullptr;
+  VERIFY_SUCCEEDED(compiler->DiscoverSourceContract(
+      request, radray::shader::RadRayDxcIncludePathListView{}, &rawResult));
+  CComPtr<radray::shader::IRadRayDxcResult> result;
+  result.Attach(rawResult);
+
+  radray::shader::RadRayDxcCompileStatus status{};
+  VERIFY_SUCCEEDED(result->GetStatus(&status));
+  VERIFY_ARE_EQUAL(radray::shader::RadRayDxcCompileStatus::Success, status);
+  radray::shader::RadRayDxcBlobView contract{};
+  VERIFY_SUCCEEDED(result->GetContractBlob(&contract));
+  VERIFY_IS_NOT_NULL(contract.Data);
+  VERIFY_IS_GREATER_THAN(contract.Size, 0u);
 }
 
 TEST_F(CompilerTest, CompileWhenDefinesThenApplied) {

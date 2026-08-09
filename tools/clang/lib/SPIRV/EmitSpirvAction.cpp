@@ -18,6 +18,8 @@ namespace clang {
 
 std::unique_ptr<ASTConsumer>
 EmitSpirvAction::CreateASTConsumer(CompilerInstance &CI, StringRef InFile) {
-  return llvm::make_unique<spirv::SpirvEmitter>(CI);
+  auto result = llvm::make_unique<spirv::SpirvEmitter>(CI);
+  emitter = result.get();
+  return result;
 }
 } // end namespace clang

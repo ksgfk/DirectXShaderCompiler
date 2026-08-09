@@ -84,11 +84,6 @@ set (HLSL_IGNORE_SOURCES
 )
 endif(WIN32)
 
-list(APPEND HLSL_IGNORE_SOURCES
-  radray_abi_probe.cpp
-  radray_dxc_d3d12_smoke.cpp
-  radray_wrong_abi_fixture.cpp)
-
 set(LIBRARIES
   clangIndex
 #  clangARCMigrate
@@ -139,6 +134,8 @@ endif()
 target_link_libraries(dxcompiler PRIVATE ${LIBRARIES})
 if (ENABLE_SPIRV_CODEGEN)
   target_link_libraries(dxcompiler PRIVATE clangSPIRV)
+  target_include_directories(dxcompiler PRIVATE
+    ${LLVM_SOURCE_DIR}/tools/clang/lib/SPIRV)
 endif (ENABLE_SPIRV_CODEGEN)
 if (ENABLE_METAL_CODEGEN)
   target_link_libraries(dxcompiler PRIVATE ${MetalIRConverter_LIB})
@@ -171,34 +168,3 @@ add_custom_target(install-dxcompiler
   COMMAND "${CMAKE_COMMAND}"
           -DCMAKE_INSTALL_COMPONENT=dxcompiler
           -P "${CMAKE_BINARY_DIR}/cmake_install.cmake")
-
-if (WIN32)
-  add_executable(radray_dxc_abi_probe EXCLUDE_FROM_ALL radray_abi_probe.cpp)
-  add_dependencies(radray_dxc_abi_probe dxcompiler)
-  target_include_directories(radray_dxc_abi_probe PRIVATE
-    ${LLVM_BINARY_DIR}/include
-    ${LLVM_MAIN_INCLUDE_DIR})
-  target_link_libraries(radray_dxc_abi_probe PRIVATE kernel32)
-
-  add_executable(radray_dxc_d3d12_smoke EXCLUDE_FROM_ALL
-                 radray_dxc_d3d12_smoke.cpp)
-  add_dependencies(radray_dxc_d3d12_smoke dxcompiler)
-  target_include_directories(radray_dxc_d3d12_smoke PRIVATE
-    ${LLVM_BINARY_DIR}/include
-    ${LLVM_MAIN_INCLUDE_DIR})
-  target_link_libraries(radray_dxc_d3d12_smoke PRIVATE
-    dxcompiler
-    d3d12
-    dxgi)
-  add_custom_command(TARGET radray_dxc_d3d12_smoke POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:dxcompiler>
-            $<TARGET_FILE_DIR:radray_dxc_d3d12_smoke>)
-
-  add_library(radray_wrong_abi_fixture SHARED EXCLUDE_FROM_ALL
-              radray_wrong_abi_fixture.cpp)
-  target_include_directories(radray_wrong_abi_fixture PRIVATE
-    ${LLVM_BINARY_DIR}/include
-    ${LLVM_MAIN_INCLUDE_DIR})
-  target_link_libraries(radray_wrong_abi_fixture PRIVATE kernel32)
-endif()

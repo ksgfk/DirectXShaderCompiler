@@ -66,6 +66,7 @@ public:
 
   ASTContext &getASTContext() { return astContext; }
   SpirvBuilder &getSpirvBuilder() { return spvBuilder; }
+  DeclResultIdMapper &getDeclResultIdMapper() { return declIdMapper; }
   SpirvContext &getSpirvContext() { return spvContext; }
   DiagnosticsEngine &getDiagnosticsEngine() { return diags; }
   CompilerInstance &getCompilerInstance() { return theCompilerInstance; }

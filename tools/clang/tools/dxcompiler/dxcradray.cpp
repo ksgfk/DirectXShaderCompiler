@@ -8,10 +8,44 @@
 //                                                                           //
 ///////////////////////////////////////////////////////////////////////////////
 
-#include "dxc/Support/WinIncludes.h"
+#include "dxc/Support/microcom.h"
 #include "dxc/dxcapi_radrayext.h"
 #include "dxc/Support/Global.h"
-#include "dxc/Support/microcom.h"
+#include "dxc/Support/Unicode.h"
+#include "dxcompilerobj_radray.h"
+
+#ifdef interface
+#undef interface
+#endif
+
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/HlslTypes.h"
+#include "clang/Frontend/CompilerInstance.h"
+#include "clang/Frontend/MultiplexConsumer.h"
+#include "clang/Lex/LiteralSupport.h"
+#include "clang/Lex/PPCallbacks.h"
+#include "clang/Lex/Pragma.h"
+#include "clang/Lex/Preprocessor.h"
+#include "clang/Basic/SourceManager.h"
+
+#include "dxc/DXIL/DxilCBuffer.h"
+#include "dxc/DXIL/DxilModule.h"
+#include "dxc/DXIL/DxilResource.h"
+#include "dxc/DxilRootSignature/DxilRootSignature.h"
+#include "dxc/DXIL/DxilSampler.h"
+#include "dxc/DXIL/DxilSignature.h"
+#include "dxc/DXIL/DxilSignatureElement.h"
+#include "dxc/DXIL/DxilTypeSystem.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Support/Casting.h"
+
+#ifdef ENABLE_SPIRV_CODEGEN
+#include "clang/SPIRV/SpirvInstruction.h"
+#include "clang/SPIRV/SpirvModule.h"
+#include "clang/SPIRV/SpirvType.h"
+#include "SpirvEmitter.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -24,6 +58,7 @@
 #include <vector>
 
 HRESULT CreateDxcCompiler(REFIID riid, _Out_ LPVOID *ppv);
+HRESULT CreateDxcUtils(REFIID riid, _Out_ LPVOID *ppv);
 
 namespace {
 
@@ -39,16 +74,16 @@ using radray::shader::RadRayDxcBlobView;
 using radray::shader::RadRayDxcCompileStatus;
 using radray::shader::RadRayDxcDiagnosticView;
 using radray::shader::RadRayDxcHash128;
+using radray::shader::RadRayDxcIncludePathListView;
 using radray::shader::RadRayDxcLaneView;
 using radray::shader::RadRayDxcTarget;
 
 constexpr uint8_t kToolchainIdentity[16] = {
-    0x07, 0x02, 0x09, 0x01, 0x72, 0x61, 0x64, 0x72,
-    0x61, 0x79, 0x2d, 0x31, 0x2e, 0x39, 0x2e, 0x31};
-constexpr uint64_t kMetadataToolchainIdentity = 0x0000000001090207ull;
+    0x08, 0x02, 0x09, 0x01, 0x72, 0x61, 0x64, 0x72,
+    0x61, 0x79, 0x2d, 0x31, 0x2e, 0x39, 0x2e, 0x33};
+constexpr uint64_t kMetadataToolchainIdentity = 0x0000000001090209ull;
 constexpr uint32_t kMaxCollectionCount = 4096;
 constexpr uint32_t kMaxEntryCount = 16;
-constexpr uint32_t kMaxRecursionDepth = 64;
 
 struct Hash128 {
   uint8_t Bytes[16]{};
@@ -205,15 +240,9 @@ struct NameValue {
   string Value;
 };
 
-struct IncludeSource {
-  string Name;
-  vector<uint8_t> Bytes;
-};
-
 struct CompileRequest {
   string SourceName;
   vector<uint8_t> RootSource;
-  vector<IncludeSource> Includes;
   vector<NameValue> Defines;
   vector<NameValue> Assignments;
   uint8_t Targets{0};
@@ -226,6 +255,21 @@ struct CompileRequest {
   uint32_t HlslVersion{2021};
   uint32_t Reserved{0};
   Hash128 ExpectedContract{};
+};
+
+struct DiscoveryRequest {
+  string SourceName;
+  vector<uint8_t> RootSource;
+  vector<NameValue> Defines;
+  uint8_t Targets{0};
+  uint32_t ShaderModel{60};
+  uint8_t Optimize{1};
+  uint8_t DebugInfo{0};
+  uint8_t AllResourcesBound{0};
+  uint8_t WarningPolicy{0};
+  uint32_t SpirvTargetEnv{0};
+  uint32_t HlslVersion{2021};
+  uint32_t Reserved{0};
 };
 
 bool ReadNameValues(WireReader &reader, vector<NameValue> &values) {
@@ -271,21 +315,6 @@ bool ReadCompileRequest(RadRayDxcBlobView view, CompileRequest &request,
     error = "compile request source identity or root source is invalid";
     return false;
   }
-  uint32_t includeCount = 0;
-  if (!reader.ReadU32(includeCount) || includeCount > kMaxCollectionCount) {
-    error = "compile request include count is invalid";
-    return false;
-  }
-  request.Includes.reserve(includeCount);
-  for (uint32_t index = 0; index < includeCount; ++index) {
-    IncludeSource include;
-    if (!reader.ReadString(include.Name) || !reader.ReadBytes(include.Bytes) ||
-        !IsLogicalSourceName(include.Name)) {
-      error = "compile request include is invalid";
-      return false;
-    }
-    request.Includes.push_back(std::move(include));
-  }
   if (!reader.ReadU8(request.Targets) || request.Targets == 0 ||
       (request.Targets & ~uint8_t{3}) != 0 ||
       !reader.ReadU32(request.ShaderModel) || !reader.ReadU8(request.Optimize) ||
@@ -305,24 +334,51 @@ bool ReadCompileRequest(RadRayDxcBlobView view, CompileRequest &request,
   return true;
 }
 
-bool ReadDiscoveryRequest(RadRayDxcBlobView view, string &sourceName,
-                          vector<uint8_t> &source, RadRayDxcTarget &target,
+bool ReadDiscoveryRequest(RadRayDxcBlobView view, DiscoveryRequest &request,
                           string &error) {
   WireReader reader{view};
   uint32_t magic = 0;
   uint16_t schema = 0;
-  uint8_t targetValue = 0;
   if (!reader.ReadU32(magic) || !reader.ReadU16(schema) ||
       magic != radray::shader::kRadRayDxcDiscoveryWireMagic ||
       schema != radray::shader::kRadRayDxcDiscoveryWireSchemaVersion ||
-      !reader.ReadString(sourceName) || !reader.ReadBytes(source) ||
-      !reader.ReadU8(targetValue) || reader.Remaining() != 0 ||
-      !IsLogicalSourceName(sourceName) || source.empty() || targetValue > 1) {
+      !reader.ReadString(request.SourceName) ||
+      !reader.ReadBytes(request.RootSource) ||
+      !IsLogicalSourceName(request.SourceName) || request.RootSource.empty() ||
+      !reader.ReadU8(request.Targets) || request.Targets == 0 ||
+      (request.Targets & ~uint8_t{3}) != 0 ||
+      !reader.ReadU32(request.ShaderModel) || !reader.ReadU8(request.Optimize) ||
+      !reader.ReadU8(request.DebugInfo) ||
+      !reader.ReadU8(request.AllResourcesBound) ||
+      !reader.ReadU8(request.WarningPolicy) ||
+      !reader.ReadU32(request.SpirvTargetEnv) ||
+      !reader.ReadU32(request.HlslVersion) || !reader.ReadU32(request.Reserved) ||
+      !ReadNameValues(reader, request.Defines) || reader.Remaining() != 0) {
     error = "discovery request wire payload is invalid";
     return false;
   }
-  target = static_cast<RadRayDxcTarget>(targetValue);
+  if (HasDuplicateNames(request.Defines)) {
+    error = "discovery request contains duplicate define names";
+    return false;
+  }
   return true;
+}
+
+DiscoveryRequest MakeDiscoveryRequest(const CompileRequest &request) {
+  DiscoveryRequest discovery;
+  discovery.SourceName = request.SourceName;
+  discovery.RootSource = request.RootSource;
+  discovery.Defines = request.Defines;
+  discovery.Targets = request.Targets;
+  discovery.ShaderModel = request.ShaderModel;
+  discovery.Optimize = request.Optimize;
+  discovery.DebugInfo = request.DebugInfo;
+  discovery.AllResourcesBound = request.AllResourcesBound;
+  discovery.WarningPolicy = request.WarningPolicy;
+  discovery.SpirvTargetEnv = request.SpirvTargetEnv;
+  discovery.HlslVersion = request.HlslVersion;
+  discovery.Reserved = request.Reserved;
+  return discovery;
 }
 
 enum class ShaderStage : uint8_t { Vertex = 0, Pixel = 1, Compute = 2 };
@@ -345,194 +401,6 @@ struct ContractData {
   Hash128 Hash{};
 };
 
-struct Diagnostic {
-  uint32_t Code{0};
-  string Message;
-};
-
-string_view Trim(string_view value) noexcept {
-  while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())) != 0)
-    value.remove_prefix(1);
-  while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())) != 0)
-    value.remove_suffix(1);
-  return value;
-}
-
-bool StartsWith(string_view value, string_view prefix) noexcept {
-  return value.size() >= prefix.size() &&
-         value.compare(0, prefix.size(), prefix) == 0;
-}
-
-bool EndsWith(string_view value, string_view suffix) noexcept {
-  return value.size() >= suffix.size() &&
-         value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
-}
-
-string CleanSource(string_view source) {
-  string output{source};
-  bool inBlockComment = false;
-  bool inString = false;
-  for (size_t index = 0; index < output.size(); ++index) {
-    const char current = output[index];
-    const char next = index + 1 < output.size() ? output[index + 1] : '\0';
-    if (inBlockComment) {
-      if (current == '*' && next == '/') {
-        output[index] = ' ';
-        output[index + 1] = ' ';
-        ++index;
-        inBlockComment = false;
-      } else if (current != '\n' && current != '\r') {
-        output[index] = ' ';
-      }
-      continue;
-    }
-    if (inString) {
-      if (current == '\\' && index + 1 < output.size() && output[index + 1] != '\n')
-        ++index;
-      else if (current == '"')
-        inString = false;
-      continue;
-    }
-    if (current == '"') {
-      inString = true;
-    } else if (current == '/' && next == '/') {
-      output[index] = ' ';
-      ++index;
-      while (index < output.size() && output[index] != '\n' && output[index] != '\r')
-        output[index++] = ' ';
-      if (index < output.size())
-        --index;
-    } else if (current == '/' && next == '*') {
-      output[index] = ' ';
-      output[index + 1] = ' ';
-      ++index;
-      inBlockComment = true;
-    }
-  }
-  return output;
-}
-
-bool IsIdentifierStart(char value) noexcept {
-  return std::isalpha(static_cast<unsigned char>(value)) != 0 || value == '_';
-}
-
-bool IsIdentifierChar(char value) noexcept {
-  return std::isalnum(static_cast<unsigned char>(value)) != 0 || value == '_';
-}
-
-bool IsConditionalAt(string_view source, size_t position) noexcept {
-  uint32_t depth = 0;
-  size_t lineStart = 0;
-  while (lineStart < position) {
-    const size_t lineEnd = source.find_first_of("\r\n", lineStart);
-    const size_t end = lineEnd == string_view::npos ? source.size() : lineEnd;
-    const string_view line = Trim(source.substr(lineStart, end - lineStart));
-    if (StartsWith(line, "#if") && !StartsWith(line, "#endif"))
-      ++depth;
-    else if (StartsWith(line, "#endif") && depth != 0)
-      --depth;
-    if (lineEnd == string_view::npos)
-      break;
-    lineStart = lineEnd + 1;
-    if (lineStart < source.size() && source[lineEnd] == '\r' && source[lineStart] == '\n')
-      ++lineStart;
-  }
-  return depth != 0;
-}
-
-bool ParseStage(string_view value, ShaderStage &stage) noexcept {
-  if (value == "vertex") {
-    stage = ShaderStage::Vertex;
-    return true;
-  }
-  if (value == "pixel") {
-    stage = ShaderStage::Pixel;
-    return true;
-  }
-  if (value == "compute") {
-    stage = ShaderStage::Compute;
-    return true;
-  }
-  return false;
-}
-
-bool ParseStageAttributes(string_view source, vector<EntryPoint> &entries,
-                          vector<Diagnostic> &diagnostics) {
-  size_t cursor = 0;
-  while ((cursor = source.find("[shader(\"", cursor)) != string_view::npos) {
-    const size_t stageBegin = cursor + 9;
-    const size_t stageEnd = source.find("\")]", stageBegin);
-    if (stageEnd == string_view::npos) {
-      diagnostics.push_back({8, "stage attribute is not closed"});
-      return false;
-    }
-    if (IsConditionalAt(source, cursor)) {
-      diagnostics.push_back({7, "stage entry is inside conditional compilation"});
-      return false;
-    }
-    ShaderStage stage{};
-    if (!ParseStage(source.substr(stageBegin, stageEnd - stageBegin), stage)) {
-      diagnostics.push_back({9, "shader stage is not supported"});
-      return false;
-    }
-    size_t functionSearch = stageEnd + 3;
-    while (functionSearch < source.size() && std::isspace(static_cast<unsigned char>(source[functionSearch])) != 0)
-      ++functionSearch;
-    while (functionSearch < source.size() && source[functionSearch] == '[') {
-      const size_t attributeEnd = source.find(']', functionSearch + 1);
-      if (attributeEnd == string_view::npos) {
-        diagnostics.push_back({8, "entry attribute is not closed"});
-        return false;
-      }
-      functionSearch = attributeEnd + 1;
-      while (functionSearch < source.size() && std::isspace(static_cast<unsigned char>(source[functionSearch])) != 0)
-        ++functionSearch;
-    }
-    const size_t openParen = source.find('(', functionSearch);
-    if (openParen == string_view::npos) {
-      diagnostics.push_back({8, "stage attribute has no entry function"});
-      return false;
-    }
-    size_t nameEnd = openParen;
-    while (nameEnd > stageEnd + 2 && std::isspace(static_cast<unsigned char>(source[nameEnd - 1])) != 0)
-      --nameEnd;
-    size_t nameBegin = nameEnd;
-    while (nameBegin > stageEnd + 2 && IsIdentifierChar(source[nameBegin - 1]))
-      --nameBegin;
-    if (nameBegin == nameEnd || !IsIdentifierStart(source[nameBegin])) {
-      diagnostics.push_back({8, "stage entry function name is invalid"});
-      return false;
-    }
-    entries.push_back({string{source.substr(nameBegin, nameEnd - nameBegin)}, stage});
-    cursor = openParen + 1;
-  }
-  return true;
-}
-
-bool ParseKeywordPragma(string_view line, KeywordGroup &group) {
-  constexpr string_view prefix = "#pragma radray_keyword_group";
-  line = Trim(line);
-  if (!StartsWith(line, prefix))
-    return false;
-  line = Trim(line.substr(prefix.size()));
-  const size_t nameEnd = line.find_first_of(" \t");
-  if (nameEnd == string_view::npos)
-    return false;
-  group.Name = string{line.substr(0, nameEnd)};
-  line.remove_prefix(nameEnd);
-  while (!(line = Trim(line)).empty()) {
-    if (line.front() != '"')
-      return false;
-    line.remove_prefix(1);
-    const size_t valueEnd = line.find('"');
-    if (valueEnd == string_view::npos || valueEnd == 0)
-      return false;
-    group.Values.emplace_back(line.substr(0, valueEnd));
-    line.remove_prefix(valueEnd + 1);
-  }
-  return !group.Name.empty() && !group.Values.empty();
-}
-
 constexpr uint32_t kMetadataNoParent = 0xffffffffu;
 constexpr uint32_t kMetadataNoType = 0xffffffffu;
 
@@ -546,13 +414,6 @@ enum class MetadataBindingKind : uint32_t {
 };
 
 constexpr uint32_t kMetadataImmutableSampler = 1u << 0;
-
-struct MetadataStageSpan {
-  ShaderStage Stage{ShaderStage::Vertex};
-  string_view EntryName;
-  size_t Begin{0};
-  size_t End{0};
-};
 
 struct MetadataBindingFact {
   string Name;
@@ -608,698 +469,718 @@ struct MetadataFacts {
   vector<MetadataTypeFact> Types;
   vector<MetadataRootConstantFact> RootConstants;
   vector<MetadataVertexInputFact> VertexInputs;
+  vector<MetadataRootBindingFact> RootBindings;
+  vector<string> StaticSamplerNames;
+  Hash128 RootSignatureHash{};
+  bool HasRootSignature{false};
+  bool HasStaticSamplerPolicy{false};
 };
 
-struct MetadataStructDecl {
-  string Name;
-  string Body;
+struct Diagnostic {
+  uint32_t Code{0};
+  string Message;
 };
 
-struct MetadataFieldDecl {
-  string Type;
-  string Name;
-  uint32_t ArrayCount{1};
+Hash128 MakeContractHash(const ContractData &contract);
+
+class RadRayContractCollector;
+
+class RadRayContractPPCallbacks final : public clang::PPCallbacks {
+public:
+  explicit RadRayContractPPCallbacks(RadRayContractCollector &collector)
+      : _collector(collector) {}
+
+  void If(clang::SourceLocation, clang::SourceRange,
+          ConditionValueKind) override;
+  void Ifdef(clang::SourceLocation, const clang::Token &,
+             const clang::MacroDefinition &) override;
+  void Ifndef(clang::SourceLocation, const clang::Token &,
+              const clang::MacroDefinition &) override;
+  void Endif(clang::SourceLocation, clang::SourceLocation) override;
+
+private:
+  RadRayContractCollector &_collector;
 };
 
-struct MetadataLayoutInfo {
-  uint32_t Size{0};
-  uint32_t Align{4};
+class RadRayKeywordPragmaHandler final : public clang::PragmaHandler {
+public:
+  explicit RadRayKeywordPragmaHandler(RadRayContractCollector &collector)
+      : clang::PragmaHandler("radray_keyword_group"), _collector(collector) {}
+
+  void HandlePragma(clang::Preprocessor &pp,
+                    clang::PragmaIntroducerKind introducer,
+                    clang::Token &firstToken) override;
+
+private:
+  RadRayContractCollector &_collector;
 };
 
-size_t MetadataSkipSpace(string_view text, size_t position) noexcept {
-  while (position < text.size() &&
-         std::isspace(static_cast<unsigned char>(text[position])) != 0)
-    ++position;
-  return position;
-}
+class RadRayContractAstVisitor
+    : public clang::RecursiveASTVisitor<RadRayContractAstVisitor> {
+public:
+  explicit RadRayContractAstVisitor(RadRayContractCollector &collector)
+      : _collector(collector) {}
 
-bool MetadataParseUnsigned(string_view text, size_t &position,
-                           uint32_t &value) noexcept {
-  position = MetadataSkipSpace(text, position);
-  const size_t begin = position;
-  uint64_t parsed = 0;
-  while (position < text.size() &&
-         std::isdigit(static_cast<unsigned char>(text[position])) != 0) {
-    parsed = parsed * 10 + static_cast<uint32_t>(text[position] - '0');
-    if (parsed > std::numeric_limits<uint32_t>::max())
-      return false;
-    ++position;
+  bool VisitFunctionDecl(clang::FunctionDecl *decl);
+
+private:
+  RadRayContractCollector &_collector;
+  vector<const clang::FunctionDecl *> _seen;
+};
+
+#ifdef ENABLE_SPIRV_CODEGEN
+class RadRaySpirvResourceUseVisitor
+    : public clang::RecursiveASTVisitor<RadRaySpirvResourceUseVisitor> {
+public:
+  RadRaySpirvResourceUseVisitor(
+      clang::spirv::DeclResultIdMapper &mapper,
+      vector<clang::spirv::SpirvVariable *> &resources)
+      : _mapper(mapper), _resources(resources) {}
+
+  void TraverseEntry(const clang::FunctionDecl *entry) {
+    TraverseFunction(entry);
+    for (size_t index = 0; index < _pending.size(); ++index)
+      TraverseFunction(_pending[index]);
   }
-  if (position == begin)
-    return false;
-  value = static_cast<uint32_t>(parsed);
-  return true;
-}
 
-bool MetadataParseBindingArguments(string_view text, size_t begin,
-                                   uint32_t &binding,
-                                   uint32_t &group) noexcept {
-  const size_t open = text.find('(', begin);
-  if (open == string_view::npos)
-    return false;
-  size_t cursor = open + 1;
-  if (!MetadataParseUnsigned(text, cursor, binding))
-    return false;
-  cursor = MetadataSkipSpace(text, cursor);
-  if (cursor >= text.size() || text[cursor] != ',')
-    return false;
-  ++cursor;
-  return MetadataParseUnsigned(text, cursor, group);
-}
-
-bool MetadataParseRegister(string_view text, uint32_t &binding,
-                           uint32_t &group) noexcept {
-  const size_t registerPosition = text.find("register(");
-  if (registerPosition == string_view::npos)
-    return false;
-  size_t cursor = registerPosition + 9;
-  cursor = MetadataSkipSpace(text, cursor);
-  if (cursor >= text.size() || (text[cursor] != 'b' && text[cursor] != 't' &&
-                                text[cursor] != 's' && text[cursor] != 'u'))
-    return false;
-  ++cursor;
-  if (!MetadataParseUnsigned(text, cursor, binding))
-    return false;
-  group = 0;
-  cursor = MetadataSkipSpace(text, cursor);
-  if (cursor < text.size() && text[cursor] == ',') {
-    ++cursor;
-    const size_t spacePosition = text.find("space", cursor);
-    if (spacePosition == string_view::npos)
-      return false;
-    cursor = spacePosition + 5;
-    cursor = MetadataSkipSpace(text, cursor);
-    if (cursor < text.size() && text[cursor] == '=')
-      ++cursor;
-    if (!MetadataParseUnsigned(text, cursor, group))
-      return false;
+  bool VisitDeclRefExpr(clang::DeclRefExpr *reference) {
+    clang::spirv::SpirvInstruction *instruction =
+        _mapper.getDeclEvalInfoIfRegistered(reference->getDecl());
+    auto *variable = llvm::dyn_cast_or_null<clang::spirv::SpirvVariable>(
+        instruction);
+    if (variable != nullptr &&
+        std::find(_resources.begin(), _resources.end(), variable) ==
+            _resources.end())
+      _resources.push_back(variable);
+    return true;
   }
-  return true;
-}
 
-bool MetadataParseTargetBinding(string_view text, RadRayDxcTarget target,
-                               uint32_t &binding, uint32_t &group) noexcept {
-  if (target == RadRayDxcTarget::SPIRV) {
-    const size_t macro = text.find("VK_BINDING(");
-    const size_t attribute = text.find("vk::binding(");
-    if (macro != string_view::npos)
-      return MetadataParseBindingArguments(text, macro, binding, group);
-    if (attribute != string_view::npos)
-      return MetadataParseBindingArguments(text, attribute, binding, group);
+  bool VisitCallExpr(clang::CallExpr *call) {
+    const clang::FunctionDecl *callee = call->getDirectCallee();
+    if (callee != nullptr && callee->hasBody() &&
+        std::find(_pending.begin(), _pending.end(), callee->getCanonicalDecl()) ==
+            _pending.end())
+      _pending.push_back(callee->getCanonicalDecl());
+    return true;
   }
-  return MetadataParseRegister(text, binding, group);
-}
 
-string MetadataReadIdentifier(string_view text, size_t &position) {
-  position = MetadataSkipSpace(text, position);
-  if (position >= text.size() || !IsIdentifierStart(text[position]))
-    return {};
-  const size_t begin = position++;
-  while (position < text.size() && IsIdentifierChar(text[position]))
-    ++position;
-  return string{text.substr(begin, position - begin)};
-}
-
-bool MetadataIsWordAt(string_view text, size_t position,
-                      string_view word) noexcept {
-  if (position > text.size() || text.substr(position, word.size()) != word)
-    return false;
-  const bool left = position == 0 || !IsIdentifierChar(text[position - 1]);
-  const size_t end = position + word.size();
-  const bool right = end >= text.size() || !IsIdentifierChar(text[end]);
-  return left && right;
-}
-
-uint32_t MetadataStageBit(ShaderStage stage) noexcept {
-  return 1u << static_cast<uint8_t>(stage);
-}
-
-const char *MetadataStageName(ShaderStage stage) noexcept {
-  switch (stage) {
-  case ShaderStage::Vertex:
-    return "vertex";
-  case ShaderStage::Pixel:
-    return "pixel";
-  case ShaderStage::Compute:
-    return "compute";
+private:
+  void TraverseFunction(const clang::FunctionDecl *function) {
+    if (function == nullptr || !function->hasBody())
+      return;
+    const clang::FunctionDecl *canonical = function->getCanonicalDecl();
+    if (std::find(_seen.begin(), _seen.end(), canonical) != _seen.end())
+      return;
+    _seen.push_back(canonical);
+    TraverseStmt(function->getBody());
   }
-  return "";
-}
 
-vector<MetadataStageSpan> FindMetadataStageSpans(
-    string_view source, const ContractData &contract) {
-  vector<MetadataStageSpan> result;
-  for (const EntryPoint &entry : contract.EntryPoints) {
-    const string marker = string{"[shader(\""} +
-                           MetadataStageName(entry.Stage) + "\")]";
-    const size_t begin = source.find(marker);
-    if (begin != string_view::npos)
-      result.push_back({entry.Stage, entry.Name, begin, source.size()});
+  clang::spirv::DeclResultIdMapper &_mapper;
+  vector<clang::spirv::SpirvVariable *> &_resources;
+  vector<const clang::FunctionDecl *> _seen;
+  vector<const clang::FunctionDecl *> _pending;
+};
+
+class RadRaySpirvEntryPointFinder
+    : public clang::RecursiveASTVisitor<RadRaySpirvEntryPointFinder> {
+public:
+  explicit RadRaySpirvEntryPointFinder(string_view entryPointName)
+      : _entryPointName(entryPointName) {}
+
+  bool VisitFunctionDecl(clang::FunctionDecl *decl) {
+    if (_entryPoint == nullptr && decl->hasBody() &&
+        decl->getNameAsString() == _entryPointName)
+      _entryPoint = decl;
+    return true;
   }
-  std::sort(result.begin(), result.end(),
-            [](const MetadataStageSpan &lhs,
-               const MetadataStageSpan &rhs) noexcept {
-              return lhs.Begin < rhs.Begin;
-            });
-  for (size_t index = 1; index < result.size(); ++index)
-    result[index - 1].End = result[index].Begin;
-  return result;
+
+  const clang::FunctionDecl *EntryPoint() const noexcept { return _entryPoint; }
+
+private:
+  string_view _entryPointName;
+  const clang::FunctionDecl *_entryPoint{nullptr};
+};
+#endif
+
+class RadRayContractConsumer final : public clang::ASTConsumer {
+public:
+  explicit RadRayContractConsumer(RadRayContractCollector &collector)
+      : _collector(collector) {}
+
+  void HandleTranslationUnit(clang::ASTContext &context) override;
+
+private:
+  RadRayContractCollector &_collector;
+};
+
+class RadRayContractCollector final {
+public:
+  explicit RadRayContractCollector(string sourceName,
+                                   RadRayDxcTarget target = RadRayDxcTarget::DXIL,
+                                   ShaderStage stage = ShaderStage::Vertex)
+      : _sourceName(std::move(sourceName)), _target(target), _stage(stage) {}
+
+  void Install(clang::Preprocessor &pp) {
+    _sourceManager = &pp.getSourceManager();
+    pp.AddPragmaHandler(new RadRayKeywordPragmaHandler(*this));
+    pp.addPPCallbacks(
+        std::make_unique<RadRayContractPPCallbacks>(*this));
+  }
+
+  void AddKeywordGroup(KeywordGroup group, clang::SourceLocation location,
+                       bool isMainFile, uint32_t conditionDepth);
+  void AddEntry(clang::FunctionDecl &decl, string stage);
+  void AddVertexInput(string semantic, uint32_t semanticIndex,
+                      uint32_t componentType, uint32_t componentCount,
+                      uint32_t location);
+  void EnterCondition(clang::SourceLocation location) {
+    _conditionStarts.push_back(location);
+    ++_conditionDepth;
+  }
+  void LeaveCondition(clang::SourceLocation location) {
+    if (!_conditionStarts.empty()) {
+      _conditions.emplace_back(_conditionStarts.back(), location);
+      _conditionStarts.pop_back();
+    }
+    if (_conditionDepth != 0)
+      --_conditionDepth;
+  }
+  uint32_t ConditionDepth() const noexcept { return _conditionDepth; }
+  bool IsInCondition(clang::SourceLocation location) const;
+  void AddDiagnostic(uint32_t code, string message) {
+    _diagnostics.push_back({code, std::move(message)});
+  }
+
+  void VisitAst(clang::ASTContext &context) {
+    RadRayContractAstVisitor visitor(*this);
+    visitor.TraverseDecl(context.getTranslationUnitDecl());
+  }
+
+  bool Finalize(ContractData &contract, vector<Diagnostic> &diagnostics) const;
+
+  const MetadataFacts &Metadata() const noexcept { return _metadata; }
+  void CollectDxilModule(llvm::Module &module);
+#ifdef ENABLE_SPIRV_CODEGEN
+  void CollectSpirvAction(clang::EmitSpirvAction &action,
+                          string_view entryPointName);
+#endif
+
+private:
+  friend class RadRayContractPPCallbacks;
+  friend class RadRayKeywordPragmaHandler;
+  friend class RadRayContractAstVisitor;
+
+  string _sourceName;
+  vector<KeywordGroup> _keywordGroups;
+  vector<EntryPoint> _entryPoints;
+  vector<Diagnostic> _diagnostics;
+  clang::SourceManager *_sourceManager{nullptr};
+  vector<clang::SourceLocation> _conditionStarts;
+  vector<std::pair<clang::SourceLocation, clang::SourceLocation>> _conditions;
+  uint32_t _conditionDepth{0};
+  RadRayDxcTarget _target{RadRayDxcTarget::DXIL};
+  ShaderStage _stage{ShaderStage::Vertex};
+  MetadataFacts _metadata;
+#ifdef ENABLE_SPIRV_CODEGEN
+  bool _sawPushConstant{false};
+#endif
+};
+
+void RadRayContractPPCallbacks::If(clang::SourceLocation location,
+                                   clang::SourceRange,
+                                   ConditionValueKind) {
+  _collector.EnterCondition(location);
 }
 
-string FindMetadataRootSignature(string_view source, size_t stageBegin) {
-  constexpr string_view prefix = "[RootSignature(\"";
-  size_t cursor = stageBegin;
-  while (cursor > 0) {
-    while (cursor > 0 &&
-           std::isspace(static_cast<unsigned char>(source[cursor - 1])) != 0)
-      --cursor;
-    if (cursor == 0 || source[cursor - 1] != ']')
+void RadRayContractPPCallbacks::Ifdef(clang::SourceLocation location,
+                                      const clang::Token &,
+                                      const clang::MacroDefinition &) {
+  _collector.EnterCondition(location);
+}
+
+void RadRayContractPPCallbacks::Ifndef(clang::SourceLocation location,
+                                       const clang::Token &,
+                                       const clang::MacroDefinition &) {
+  _collector.EnterCondition(location);
+}
+
+void RadRayContractPPCallbacks::Endif(clang::SourceLocation location,
+                                      clang::SourceLocation) {
+  _collector.LeaveCondition(location);
+}
+
+void RadRayKeywordPragmaHandler::HandlePragma(
+    clang::Preprocessor &pp, clang::PragmaIntroducerKind,
+    clang::Token &firstToken) {
+  const clang::SourceLocation location = firstToken.getLocation();
+  const bool isMainFile =
+      pp.getSourceManager().isWrittenInMainFile(location);
+  const uint32_t conditionDepth = _collector.ConditionDepth();
+
+  clang::Token token;
+  pp.LexUnexpandedToken(token);
+  if (token.isNot(clang::tok::identifier)) {
+    _collector.AddDiagnostic(3, "keyword group pragma is malformed");
+    pp.DiscardUntilEndOfDirective();
+    return;
+  }
+
+  KeywordGroup group;
+  group.Name = token.getIdentifierInfo()->getName().str();
+  while (true) {
+    pp.LexUnexpandedToken(token);
+    if (token.is(clang::tok::eod))
       break;
-    const size_t open = source.rfind('[', cursor - 1);
-    if (open == string_view::npos)
-      break;
-    const string_view attribute = Trim(source.substr(open, cursor - open));
-    if (StartsWith(attribute, prefix) && EndsWith(attribute, "\")]" ) &&
-        attribute.size() >= prefix.size() + 3)
-      return string{attribute.substr(prefix.size(),
-                                     attribute.size() - prefix.size() - 3)};
-    cursor = open;
+    if (token.isNot(clang::tok::string_literal)) {
+      _collector.AddDiagnostic(3, "keyword group pragma is malformed");
+      pp.DiscardUntilEndOfDirective();
+      return;
+    }
+    clang::StringLiteralParser parser(llvm::ArrayRef<clang::Token>(&token, 1),
+                                      pp);
+    if (parser.hadError || !parser.isAscii() || parser.GetString().empty()) {
+      _collector.AddDiagnostic(3, "keyword group pragma is malformed");
+      pp.DiscardUntilEndOfDirective();
+      return;
+    }
+    group.Values.emplace_back(parser.GetString().str());
   }
-  return {};
+
+  if (group.Name.empty() || group.Values.empty()) {
+    _collector.AddDiagnostic(3, "keyword group pragma is malformed");
+    return;
+  }
+  _collector.AddKeywordGroup(std::move(group), location, isMainFile,
+                             conditionDepth);
 }
 
-bool ParseMetadataRootBinding(string_view signature, size_t begin,
-                              string_view token,
-                              MetadataRootBindingFact &result) noexcept {
-  size_t cursor = begin + token.size();
-  cursor = MetadataSkipSpace(signature, cursor);
-  if (cursor >= signature.size() ||
-      (signature[cursor] != 'b' && signature[cursor] != 't' &&
-       signature[cursor] != 'u' && signature[cursor] != 's'))
-    return false;
-  switch (signature[cursor]) {
-  case 'b':
-    result.RegisterClass = 0;
-    break;
-  case 't':
-    result.RegisterClass = 1;
-    break;
-  case 'u':
-    result.RegisterClass = 2;
-    break;
-  case 's':
-    result.RegisterClass = 3;
-    break;
-  default:
-    return false;
-  }
-  ++cursor;
-  if (!MetadataParseUnsigned(signature, cursor, result.Binding))
-    return false;
+bool RadRayContractAstVisitor::VisitFunctionDecl(clang::FunctionDecl *decl) {
+  const clang::HLSLShaderAttr *attribute =
+      decl->getAttr<clang::HLSLShaderAttr>();
+  if (attribute == nullptr || !decl->hasBody())
+    return true;
 
-  const size_t close = signature.find(')', cursor);
-  if (close == string_view::npos)
-    return false;
-  const size_t space = signature.find("space", cursor);
-  if (space != string_view::npos && space < close) {
-    cursor = space + 5;
-    cursor = MetadataSkipSpace(signature, cursor);
-    if (cursor < close && signature[cursor] == '=')
-      ++cursor;
-    if (!MetadataParseUnsigned(signature, cursor, result.Group))
-      return false;
-  }
-  return true;
-}
+  const clang::FunctionDecl *canonical = decl->getCanonicalDecl();
+  if (std::find(_seen.begin(), _seen.end(), canonical) != _seen.end())
+    return true;
+  _seen.push_back(canonical);
+  _collector.AddEntry(*decl, attribute->getStage().str());
+  if (attribute->getStage() == "vertex") {
+    uint32_t location = 0;
+    for (const clang::ParmVarDecl *parameter : decl->parameters()) {
+      string semantic;
+      uint32_t semanticIndex = 0;
+      for (const hlsl::UnusualAnnotation *annotation :
+           parameter->getUnusualAnnotations()) {
+        const auto *semanticDecl = llvm::dyn_cast<hlsl::SemanticDecl>(annotation);
+        if (semanticDecl == nullptr)
+          continue;
+        semantic = semanticDecl->SemanticName.str();
+        size_t suffix = semantic.size();
+        while (suffix != 0 &&
+               std::isdigit(static_cast<unsigned char>(semantic[suffix - 1])) != 0)
+          --suffix;
+        for (size_t index = suffix; index < semantic.size(); ++index)
+          semanticIndex = semanticIndex * 10u +
+                          static_cast<uint32_t>(semantic[index] - '0');
+        semantic.resize(suffix);
+        break;
+      }
+      if (semantic.empty() ||
+          (semantic.size() >= 3 && semantic.compare(0, 3, "SV_") == 0))
+        continue;
 
-vector<MetadataRootBindingFact> ParseMetadataRootBindings(
-    string_view signature) {
-  vector<MetadataRootBindingFact> result;
-  constexpr string_view tokens[] = {
-      "CBV(", "SRV(", "UAV(", "Sampler(", "StaticSampler("};
-  for (const string_view token : tokens) {
-    size_t cursor = 0;
-    while ((cursor = signature.find(token, cursor)) != string_view::npos) {
-      MetadataRootBindingFact binding;
-      if (!ParseMetadataRootBinding(signature, cursor, token, binding))
-        return {};
-      result.push_back(binding);
-      cursor += token.size();
-    }
-  }
-  return result;
-}
-
-bool ValidateMetadataRootBindings(
-    string_view signature, const vector<MetadataBindingFact> &bindings,
-    vector<Diagnostic> &diagnostics) {
-  const vector<MetadataRootBindingFact> rootBindings =
-      ParseMetadataRootBindings(signature);
-  constexpr string_view tokens[] = {
-      "CBV(", "SRV(", "UAV(", "Sampler(", "StaticSampler("};
-  bool hasResourceToken = false;
-  for (const string_view token : tokens) {
-    if (signature.find(token) != string_view::npos) {
-      hasResourceToken = true;
-      break;
-    }
-  }
-  if (!hasResourceToken)
-    return bindings.empty();
-  if (rootBindings.empty() && !signature.empty()) {
-    diagnostics.push_back(
-        {2106, "DXIL RootSignature contains no parseable resource bindings"});
-    return false;
-  }
-
-  for (const MetadataBindingFact &binding : bindings) {
-    const auto found = std::find_if(
-        rootBindings.begin(), rootBindings.end(),
-        [&](const MetadataRootBindingFact &root) noexcept {
-          return root.RegisterClass == binding.RegisterClass &&
-                 root.Binding == binding.Binding && root.Group == binding.Group;
-        });
-    if (found == rootBindings.end()) {
-      diagnostics.push_back(
-          {2106, "DXIL RootSignature does not contain an active resource"});
-      return false;
-    }
-  }
-  for (const MetadataRootBindingFact &root : rootBindings) {
-    const auto found = std::find_if(
-        bindings.begin(), bindings.end(),
-        [&](const MetadataBindingFact &binding) noexcept {
-          return root.RegisterClass == binding.RegisterClass &&
-                 root.Binding == binding.Binding && root.Group == binding.Group;
-        });
-    if (found == bindings.end()) {
-      diagnostics.push_back(
-          {2106, "DXIL RootSignature contains an inactive resource"});
-      return false;
+      clang::QualType elementType = hlsl::GetElementTypeOrType(parameter->getType());
+      if (hlsl::IsHLSLVecType(parameter->getType()))
+        elementType = hlsl::GetHLSLVecElementType(parameter->getType());
+      uint32_t componentType = 0;
+      if (const auto *builtin = elementType->getAs<clang::BuiltinType>()) {
+        if (builtin->isFloatingPoint())
+          componentType = 1;
+        else if (builtin->isSignedInteger())
+          componentType = 2;
+        else if (builtin->isUnsignedInteger())
+          componentType = 3;
+      }
+      const uint32_t componentCount = hlsl::IsHLSLVecType(parameter->getType())
+                                          ? hlsl::GetHLSLVecSize(parameter->getType())
+                                          : 1u;
+      if (componentType != 0 && componentCount != 0)
+        _collector.AddVertexInput(std::move(semantic), semanticIndex,
+                                  componentType, componentCount, location++);
     }
   }
   return true;
 }
 
-bool ParseMetadataResourceLine(string_view line, RadRayDxcTarget target,
-                               MetadataBindingFact &result) {
-  line = Trim(line);
-  if (line.empty() || line.front() == '#' || StartsWith(line, "struct ") ||
-      line.front() == '[')
-    return false;
-
-  string_view typeToken;
-  MetadataBindingKind kind = MetadataBindingKind::Texture;
-  constexpr string_view tokens[] = {
-      "RWStructuredBuffer", "StructuredBuffer", "RWByteAddressBuffer",
-      "ByteAddressBuffer",  "RWTexture",       "Texture",
-      "SamplerState",       "SamplerComparisonState", "ConstantBuffer",
-      "cbuffer"};
-  constexpr MetadataBindingKind kinds[] = {
-      MetadataBindingKind::RWBuffer, MetadataBindingKind::Buffer,
-      MetadataBindingKind::RWBuffer, MetadataBindingKind::Buffer,
-      MetadataBindingKind::RWTexture, MetadataBindingKind::Texture,
-      MetadataBindingKind::Sampler, MetadataBindingKind::Sampler,
-      MetadataBindingKind::CBuffer, MetadataBindingKind::CBuffer};
-  size_t typePosition = string_view::npos;
-  for (size_t index = 0; index < std::size(tokens); ++index) {
-    const size_t candidate = line.find(tokens[index]);
-    if (candidate != string_view::npos &&
-        (typePosition == string_view::npos || candidate < typePosition)) {
-      typePosition = candidate;
-      typeToken = tokens[index];
-      kind = kinds[index];
-    }
-  }
-  if (typePosition == string_view::npos)
-    return false;
-
-  size_t namePosition = typePosition + typeToken.size();
-  const size_t templateEnd = line.find('>', namePosition);
-  if (templateEnd != string_view::npos &&
-      line.find('<', namePosition) < templateEnd)
-    namePosition = templateEnd + 1;
-  result.Name = MetadataReadIdentifier(line, namePosition);
-  if (result.Name.empty())
-    return false;
-  namePosition = MetadataSkipSpace(line, namePosition);
-  if (namePosition < line.size() && line[namePosition] == '[') {
-    ++namePosition;
-    if (!MetadataParseUnsigned(line, namePosition, result.Count) ||
-        line.find(']', namePosition) == string_view::npos)
-      return false;
-  }
-  result.Type = static_cast<uint32_t>(kind);
-  switch (kind) {
-  case MetadataBindingKind::CBuffer:
-    result.RegisterClass = 0;
-    break;
-  case MetadataBindingKind::Buffer:
-  case MetadataBindingKind::Texture:
-    result.RegisterClass = 1;
-    break;
-  case MetadataBindingKind::RWBuffer:
-  case MetadataBindingKind::RWTexture:
-    result.RegisterClass = 2;
-    break;
-  case MetadataBindingKind::Sampler:
-    result.RegisterClass = 3;
-    break;
-  }
-  result.HasExplicitBinding = MetadataParseTargetBinding(
-      line, target, result.Binding, result.Group);
-  return true;
+void RadRayContractConsumer::HandleTranslationUnit(
+    clang::ASTContext &context) {
+  _collector.VisitAst(context);
 }
 
-bool MetadataUsesIdentifier(string_view text, string_view name) noexcept {
-  size_t cursor = 0;
-  while ((cursor = text.find(name, cursor)) != string_view::npos) {
-    const bool left = cursor == 0 || !IsIdentifierChar(text[cursor - 1]);
-    const size_t end = cursor + name.size();
-    const bool right = end >= text.size() || !IsIdentifierChar(text[end]);
-    if (left && right)
-      return true;
-    cursor = end;
+class RadRayContractAction final : public clang::WrapperFrontendAction {
+public:
+  RadRayContractAction(std::unique_ptr<clang::FrontendAction> action,
+                       RadRayContractCollector &collector)
+      : clang::WrapperFrontendAction(action.release()),
+        _collector(collector) {}
+
+protected:
+  bool BeginSourceFileAction(clang::CompilerInstance &compiler,
+                             clang::StringRef filename) override {
+    _collector.Install(compiler.getPreprocessor());
+    return clang::WrapperFrontendAction::BeginSourceFileAction(compiler,
+                                                                filename);
+  }
+
+  std::unique_ptr<clang::ASTConsumer>
+  CreateASTConsumer(clang::CompilerInstance &compiler,
+                    clang::StringRef filename) override {
+    std::unique_ptr<clang::ASTConsumer> wrapped =
+        clang::WrapperFrontendAction::CreateASTConsumer(compiler, filename);
+    if (!wrapped)
+      return nullptr;
+    vector<std::unique_ptr<clang::ASTConsumer>> consumers;
+    consumers.push_back(std::move(wrapped));
+    consumers.push_back(std::make_unique<RadRayContractConsumer>(_collector));
+    return std::make_unique<clang::MultiplexConsumer>(std::move(consumers));
+  }
+
+private:
+  RadRayContractCollector &_collector;
+};
+
+class RadRayFrontendObserver final : public RadRayCompilerObserver {
+public:
+  explicit RadRayFrontendObserver(
+      string sourceName, RadRayDxcTarget target = RadRayDxcTarget::DXIL,
+      ShaderStage stage = ShaderStage::Vertex, bool syntaxOnly = false,
+      string entryPointName = {})
+      : _collector(std::move(sourceName), target, stage),
+        _entryPointName(std::move(entryPointName)),
+        _syntaxOnly(syntaxOnly) {}
+
+  std::unique_ptr<clang::FrontendAction> WrapAction(
+      std::unique_ptr<clang::FrontendAction> action) override {
+    return std::make_unique<RadRayContractAction>(std::move(action),
+                                                   _collector);
+  }
+
+  bool UseSyntaxOnly() const override { return _syntaxOnly; }
+
+  void OnDxilModule(llvm::Module &module) override {
+    _collector.CollectDxilModule(module);
+  }
+
+#ifdef ENABLE_SPIRV_CODEGEN
+  void OnSpirvActionComplete(clang::EmitSpirvAction &action) override {
+    _collector.CollectSpirvAction(action, _entryPointName);
+  }
+#endif
+
+  bool Finalize(ContractData &contract, vector<Diagnostic> &diagnostics) const {
+    return _collector.Finalize(contract, diagnostics);
+  }
+
+  const MetadataFacts &Metadata() const noexcept { return _collector.Metadata(); }
+
+private:
+  RadRayContractCollector _collector;
+  string _entryPointName;
+  bool _syntaxOnly{false};
+};
+
+bool EndsWith(string_view value, string_view suffix) noexcept {
+  return value.size() >= suffix.size() &&
+         value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+bool ParseStage(string_view value, ShaderStage &stage) noexcept {
+  if (value == "vertex") {
+    stage = ShaderStage::Vertex;
+    return true;
+  }
+  if (value == "pixel") {
+    stage = ShaderStage::Pixel;
+    return true;
+  }
+  if (value == "compute") {
+    stage = ShaderStage::Compute;
+    return true;
   }
   return false;
 }
 
-vector<MetadataStructDecl> ParseMetadataStructs(string_view source) {
-  vector<MetadataStructDecl> result;
-  size_t cursor = 0;
-  while ((cursor = source.find("struct", cursor)) != string_view::npos) {
-    if (!MetadataIsWordAt(source, cursor, "struct")) {
-      ++cursor;
-      continue;
-    }
-    size_t namePosition = cursor + 6;
-    string name = MetadataReadIdentifier(source, namePosition);
-    const size_t open = source.find('{', namePosition);
-    if (name.empty() || open == string_view::npos) {
-      cursor += 6;
-      continue;
-    }
-    uint32_t depth = 1;
-    size_t close = open + 1;
-    for (; close < source.size() && depth != 0; ++close) {
-      if (source[close] == '{')
-        ++depth;
-      else if (source[close] == '}')
-        --depth;
-    }
-    if (depth != 0)
-      break;
-    result.push_back({std::move(name), string{source.substr(open + 1,
-                                                             close - open - 2)}});
-    cursor = close;
-  }
-  return result;
-}
-
-vector<MetadataFieldDecl> ParseMetadataFields(string_view body) {
-  vector<MetadataFieldDecl> result;
-  size_t begin = 0;
-  while (begin < body.size()) {
-    const size_t end = body.find(';', begin);
-    const string_view statement = Trim(body.substr(
-        begin, end == string_view::npos ? body.size() - begin : end - begin));
-    begin = end == string_view::npos ? body.size() : end + 1;
-    if (statement.empty() || statement.find('{') != string_view::npos)
-      continue;
-    size_t cursor = 0;
-    string type = MetadataReadIdentifier(statement, cursor);
-    string name = MetadataReadIdentifier(statement, cursor);
-    if (type.empty() || name.empty())
-      continue;
-    uint32_t arrayCount = 1;
-    cursor = MetadataSkipSpace(statement, cursor);
-    if (cursor < statement.size() && statement[cursor] == '[') {
-      ++cursor;
-      if (!MetadataParseUnsigned(statement, cursor, arrayCount))
-        continue;
-    }
-    result.push_back({std::move(type), std::move(name), arrayCount});
-  }
-  return result;
-}
-
-struct MetadataVertexFieldDecl {
-  string Type;
-  string Semantic;
-  uint32_t SemanticIndex{0};
-};
-
-bool ParseMetadataSemantic(string_view text, string &semantic,
-                           uint32_t &semanticIndex) noexcept {
-  size_t cursor = 0;
-  semantic = MetadataReadIdentifier(Trim(text), cursor);
-  if (semantic.empty())
-    return false;
-  size_t suffix = semantic.size();
-  while (suffix != 0 &&
-         std::isdigit(static_cast<unsigned char>(semantic[suffix - 1])) != 0)
-    --suffix;
-  semanticIndex = 0;
-  for (size_t index = suffix; index < semantic.size(); ++index) {
-    semanticIndex = semanticIndex * 10u +
-                    static_cast<uint32_t>(semantic[index] - '0');
-  }
-  semantic.resize(suffix);
-  return !semantic.empty();
-}
-
-vector<MetadataVertexFieldDecl> ParseMetadataVertexFields(string_view body) {
-  vector<MetadataVertexFieldDecl> result;
-  size_t begin = 0;
-  while (begin < body.size()) {
-    const size_t end = body.find(';', begin);
-    const string_view statement = Trim(body.substr(
-        begin, end == string_view::npos ? body.size() - begin : end - begin));
-    begin = end == string_view::npos ? body.size() : end + 1;
-    const size_t colon = statement.find(':');
-    if (statement.empty() || colon == string_view::npos)
-      continue;
-    size_t cursor = 0;
-    const string type = MetadataReadIdentifier(statement.substr(0, colon), cursor);
-    if (type.empty())
-      continue;
-    const string semanticText = string{Trim(statement.substr(colon + 1))};
-    string semantic;
-    uint32_t semanticIndex = 0;
-    if (!ParseMetadataSemantic(semanticText, semantic, semanticIndex))
-      continue;
-    result.push_back({type, std::move(semantic), semanticIndex});
-  }
-  return result;
-}
-
-bool ParseMetadataVertexComponentShape(string_view type, uint32_t &componentType,
-                                       uint32_t &componentCount) noexcept {
-  string_view suffix;
-  if (StartsWith(type, "float") || StartsWith(type, "half")) {
-    componentType = 1;
-    suffix = StartsWith(type, "float") ? type.substr(5) : type.substr(4);
-  } else if (StartsWith(type, "int")) {
-    componentType = 2;
-    suffix = type.substr(3);
-  } else if (StartsWith(type, "uint")) {
-    componentType = 3;
-    suffix = type.substr(4);
-  } else {
-    return false;
-  }
-  if (suffix.empty()) {
-    componentCount = 1;
-    return true;
-  }
-  if (suffix.size() != 1 || suffix.front() < '1' || suffix.front() > '4')
-    return false;
-  componentCount = static_cast<uint32_t>(suffix.front() - '0');
-  return true;
-}
-
-bool BuildMetadataVertexInputs(string_view source,
-                               const ContractData &contract,
-                               MetadataFacts &facts,
-                               vector<Diagnostic> &diagnostics) {
-  const auto vertexEntry = std::find_if(
-      contract.EntryPoints.begin(), contract.EntryPoints.end(),
-      [](const EntryPoint &entry) noexcept {
-        return entry.Stage == ShaderStage::Vertex;
-      });
-  if (vertexEntry == contract.EntryPoints.end())
-    return true;
-
-  const size_t functionName = source.find(vertexEntry->Name);
-  const size_t open = functionName == string_view::npos
-                          ? string_view::npos
-                          : source.find('(', functionName + vertexEntry->Name.size());
-  if (open == string_view::npos) {
-    diagnostics.push_back({2107, "vertex entry input signature is unavailable"});
-    return false;
-  }
-  size_t close = open + 1;
-  uint32_t depth = 1;
-  for (; close < source.size() && depth != 0; ++close) {
-    if (source[close] == '(')
-      ++depth;
-    else if (source[close] == ')')
-      --depth;
-  }
-  if (depth != 0) {
-    diagnostics.push_back({2107, "vertex entry input signature is malformed"});
-    return false;
-  }
-
-  const vector<MetadataStructDecl> structs = ParseMetadataStructs(source);
-  const string_view parameters = source.substr(open + 1, close - open - 2);
-  uint32_t location = 0;
-  size_t begin = 0;
-  while (begin <= parameters.size()) {
-    const size_t end = parameters.find(',', begin);
-    const string_view parameter = Trim(parameters.substr(
-        begin, end == string_view::npos ? parameters.size() - begin : end - begin));
-    begin = end == string_view::npos ? parameters.size() + 1 : end + 1;
-    if (parameter.empty())
-      continue;
-
-    vector<MetadataVertexFieldDecl> fields;
-    if (parameter.find(':') != string_view::npos) {
-      string statement{parameter};
-      statement.push_back(';');
-      fields = ParseMetadataVertexFields(statement);
-    } else {
-      size_t cursor = 0;
-      const string type = MetadataReadIdentifier(parameter, cursor);
-      const auto structure = std::find_if(
-          structs.begin(), structs.end(),
-          [&](const MetadataStructDecl &value) noexcept {
-            return value.Name == type;
-          });
-      if (structure != structs.end())
-        fields = ParseMetadataVertexFields(structure->Body);
-    }
-
-    for (const MetadataVertexFieldDecl &field : fields) {
-      if (StartsWith(field.Semantic, "SV_"))
-        continue;
-      uint32_t componentType = 0;
-      uint32_t componentCount = 0;
-      if (!ParseMetadataVertexComponentShape(field.Type, componentType,
-                                              componentCount)) {
-        diagnostics.push_back({2107, "vertex input type is not representable"});
-        return false;
-      }
-      const auto duplicate = std::find_if(
-          facts.VertexInputs.begin(), facts.VertexInputs.end(),
-          [&](const MetadataVertexInputFact &value) noexcept {
-            return value.Semantic == field.Semantic &&
-                   value.SemanticIndex == field.SemanticIndex;
-          });
-      if (duplicate != facts.VertexInputs.end()) {
-        diagnostics.push_back({2108, "vertex input semantic is duplicated"});
-        return false;
-      }
-      facts.VertexInputs.push_back({field.Semantic, field.SemanticIndex,
-                                    location++, componentType, componentCount,
-                                    0});
-    }
-  }
-  return true;
-}
-
-MetadataLayoutInfo MetadataPrimitiveLayout(string_view type) noexcept {
-  if (type == "float" || type == "int" || type == "uint" ||
-      type == "bool")
-    return {4, 4};
-  if (type == "float2" || type == "int2" || type == "uint2")
-    return {8, 8};
-  if (type == "float3" || type == "int3" || type == "uint3")
-    return {12, 16};
-  if (type == "float4" || type == "int4" || type == "uint4")
-    return {16, 16};
-  if (type == "float3x3")
-    return {48, 16};
-  if (type == "float4x4")
-    return {64, 16};
-  return {0, 4};
-}
-
-MetadataLayoutInfo FindMetadataStructLayout(
-    string_view type, const vector<MetadataStructDecl> &structs,
-    vector<bool> &visiting, vector<MetadataLayoutInfo> &layouts) {
-  const auto found = std::find_if(
-      structs.begin(), structs.end(),
-      [&](const MetadataStructDecl &value) noexcept { return value.Name == type; });
-  if (found == structs.end())
-    return MetadataPrimitiveLayout(type);
-  const size_t index = static_cast<size_t>(found - structs.begin());
-  if (layouts[index].Size != 0)
-    return layouts[index];
-  if (visiting[index])
-    return {};
-  visiting[index] = true;
-  uint32_t offset = 0;
-  uint32_t alignment = 16;
-  for (const MetadataFieldDecl &field : ParseMetadataFields(found->Body)) {
-    const MetadataLayoutInfo fieldLayout = FindMetadataStructLayout(
-        field.Type, structs, visiting, layouts);
-    alignment = std::max(alignment, fieldLayout.Align);
-    offset = (offset + fieldLayout.Align - 1) / fieldLayout.Align *
-             fieldLayout.Align;
-    const uint64_t size = static_cast<uint64_t>(fieldLayout.Size) *
-                          field.ArrayCount;
-    offset = size > std::numeric_limits<uint32_t>::max() - offset
-                 ? 0
-                 : offset + static_cast<uint32_t>(size);
-  }
-  const uint32_t size = (offset + alignment - 1) / alignment * alignment;
-  layouts[index] = {size == 0 ? 16u : size, alignment};
-  visiting[index] = false;
-  return layouts[index];
-}
-
-void AddMetadataTypeFacts(const vector<MetadataStructDecl> &structs,
-                          size_t structIndex, uint32_t parent,
-                          vector<bool> &visiting,
-                          vector<MetadataLayoutInfo> &layouts,
-                          vector<MetadataTypeFact> &output) {
-  if (structIndex >= structs.size() || visiting[structIndex])
+void RadRayContractCollector::AddKeywordGroup(
+    KeywordGroup group, clang::SourceLocation, bool isMainFile,
+    uint32_t conditionDepth) {
+  if (!isMainFile || EndsWith(_sourceName, ".hlsli") || conditionDepth != 0) {
+    AddDiagnostic(6,
+                  "keyword group pragma must be in the root source outside conditions");
     return;
-  const MetadataLayoutInfo layout = FindMetadataStructLayout(
-      structs[structIndex].Name, structs, visiting, layouts);
-  visiting[structIndex] = true;
-  const uint32_t ownIndex = static_cast<uint32_t>(output.size());
-  output.push_back({structs[structIndex].Name, parent,
-                    4u, 1u, 0u, layout.Size, layout.Size, 0u,
-                    kMetadataNoType, {}});
-  uint32_t offset = 0;
-  for (const MetadataFieldDecl &field :
-       ParseMetadataFields(structs[structIndex].Body)) {
-    const MetadataLayoutInfo fieldLayout = FindMetadataStructLayout(
-        field.Type, structs, visiting, layouts);
-    offset = (offset + fieldLayout.Align - 1) / fieldLayout.Align *
-             fieldLayout.Align;
-    const bool isStruct = std::any_of(
-        structs.begin(), structs.end(),
-        [&](const MetadataStructDecl &value) noexcept {
-          return value.Name == field.Type;
-        });
-    uint32_t kind = isStruct ? 4u : 1u;
-    if (field.Type.find('x') != string_view::npos)
-      kind = 3u;
-    else if (field.Type.size() > 1 &&
-             std::isdigit(static_cast<unsigned char>(field.Type.back())) != 0)
-      kind = 2u;
-    if (field.ArrayCount > 1)
-      kind = 5u;
-    const uint32_t size = fieldLayout.Size * field.ArrayCount;
-    output.push_back({field.Name, ownIndex, kind, field.ArrayCount, offset,
-                      size, fieldLayout.Size, 0u, kMetadataNoType, {}});
-    output.back().UnderlyingType = field.Type;
-    offset += size;
   }
-  visiting[structIndex] = false;
+
+  std::sort(group.Values.begin(), group.Values.end());
+  for (const KeywordGroup &existing : _keywordGroups) {
+    if (existing.Name == group.Name) {
+      AddDiagnostic(4, "keyword group is declared more than once");
+      return;
+    }
+    for (const string &left : existing.Values) {
+      for (const string &right : group.Values) {
+        if (left == right) {
+          AddDiagnostic(15, "keyword value is repeated across groups");
+          return;
+        }
+      }
+    }
+  }
+  for (size_t index = 1; index < group.Values.size(); ++index) {
+    if (group.Values[index - 1] == group.Values[index]) {
+      AddDiagnostic(5, "keyword value is declared more than once");
+      return;
+    }
+  }
+  _keywordGroups.push_back(std::move(group));
+}
+
+bool RadRayContractCollector::IsInCondition(
+    clang::SourceLocation location) const {
+  if (!_sourceManager || location.isInvalid())
+    return false;
+  for (const auto &condition : _conditions) {
+    if (condition.first.isInvalid() || condition.second.isInvalid())
+      continue;
+    if (!_sourceManager->isBeforeInTranslationUnit(location, condition.first) &&
+        !_sourceManager->isBeforeInTranslationUnit(condition.second, location))
+      return true;
+  }
+  return false;
+}
+
+void RadRayContractCollector::AddEntry(clang::FunctionDecl &decl,
+                                        string stageName) {
+  ShaderStage stage{};
+  if (!ParseStage(stageName, stage)) {
+    AddDiagnostic(9, "shader stage is not supported");
+    return;
+  }
+  if (decl.getName().empty()) {
+    AddDiagnostic(8, "stage entry function name is invalid");
+    return;
+  }
+  if (IsInCondition(decl.getLocation())) {
+    AddDiagnostic(7, "stage entry is inside conditional compilation");
+    return;
+  }
+  _entryPoints.push_back({decl.getName().str(), stage});
+}
+
+void RadRayContractCollector::AddVertexInput(string semantic,
+                                              uint32_t semanticIndex,
+                                              uint32_t componentType,
+                                              uint32_t componentCount,
+                                              uint32_t location) {
+  const auto duplicate = std::find_if(
+      _metadata.VertexInputs.begin(), _metadata.VertexInputs.end(),
+      [&](const MetadataVertexInputFact &value) noexcept {
+        return value.Semantic == semantic && value.SemanticIndex == semanticIndex;
+      });
+  if (duplicate == _metadata.VertexInputs.end()) {
+    _metadata.VertexInputs.push_back({std::move(semantic), semanticIndex,
+                                      location, componentType, componentCount,
+                                      0});
+  }
+}
+
+bool RadRayContractCollector::Finalize(
+    ContractData &contract, vector<Diagnostic> &diagnostics) const {
+  diagnostics.insert(diagnostics.end(), _diagnostics.begin(), _diagnostics.end());
+  if (!_diagnostics.empty())
+    return false;
+
+  contract = {};
+  contract.KeywordGroups = _keywordGroups;
+  contract.EntryPoints = _entryPoints;
+
+  uint32_t vertexCount = 0;
+  uint32_t pixelCount = 0;
+  uint32_t computeCount = 0;
+  for (const EntryPoint &entry : contract.EntryPoints) {
+    vertexCount += entry.Stage == ShaderStage::Vertex;
+    pixelCount += entry.Stage == ShaderStage::Pixel;
+    computeCount += entry.Stage == ShaderStage::Compute;
+  }
+  if (computeCount != 0 && (vertexCount != 0 || pixelCount != 0)) {
+    diagnostics.push_back(
+        {14, "graphics and compute entries cannot share a source unit"});
+    return false;
+  }
+  if (computeCount == 0 && vertexCount == 0) {
+    diagnostics.push_back({10, "graphics source has no vertex entry"});
+    return false;
+  }
+  if (computeCount == 0 && vertexCount > 1) {
+    diagnostics.push_back({11, "graphics source has multiple vertex entries"});
+    return false;
+  }
+  if (pixelCount > 1) {
+    diagnostics.push_back({12, "graphics source has multiple pixel entries"});
+    return false;
+  }
+  if (computeCount > 1) {
+    diagnostics.push_back({13, "compute source has multiple entries"});
+    return false;
+  }
+
+  contract.Kind = computeCount == 0 ? ShaderKind::Graphics : ShaderKind::Compute;
+  std::sort(contract.KeywordGroups.begin(), contract.KeywordGroups.end(),
+            [](const KeywordGroup &lhs, const KeywordGroup &rhs) {
+              return lhs.Name < rhs.Name;
+            });
+  std::sort(contract.EntryPoints.begin(), contract.EntryPoints.end(),
+            [](const EntryPoint &lhs, const EntryPoint &rhs) {
+              return std::make_pair(lhs.Stage, lhs.Name) <
+                     std::make_pair(rhs.Stage, rhs.Name);
+            });
+  contract.Hash = MakeContractHash(contract);
+  return true;
+}
+
+uint32_t MetadataStageBitFor(ShaderStage stage) noexcept {
+  return 1u << static_cast<uint8_t>(stage);
+}
+
+uint32_t MetadataRegisterNamespace(MetadataBindingKind kind) noexcept {
+  switch (kind) {
+  case MetadataBindingKind::CBuffer:
+    return 0;
+  case MetadataBindingKind::Buffer:
+  case MetadataBindingKind::Texture:
+    return 1;
+  case MetadataBindingKind::RWBuffer:
+  case MetadataBindingKind::RWTexture:
+    return 2;
+  case MetadataBindingKind::Sampler:
+    return 3;
+  }
+  return 0xffffffffu;
+}
+
+MetadataBindingFact *AddMetadataBinding(MetadataFacts &facts, string name,
+                                        uint32_t group, uint32_t binding,
+                                        MetadataBindingKind kind, uint32_t count,
+                                        ShaderStage stage, uint32_t flags = 0) {
+  if (name.empty())
+    return nullptr;
+  const auto found = std::find_if(
+      facts.Bindings.begin(), facts.Bindings.end(),
+      [&](const MetadataBindingFact &value) noexcept {
+        return value.Name == name && value.Group == group &&
+               value.Binding == binding &&
+               value.Type == static_cast<uint32_t>(kind);
+      });
+  if (found != facts.Bindings.end()) {
+    found->StageMask |= MetadataStageBitFor(stage);
+    found->Count = std::max(found->Count, std::max(1u, count));
+    found->Flags |= flags;
+    return &*found;
+  }
+  facts.Bindings.push_back({std::move(name), group, binding,
+                            MetadataRegisterNamespace(kind),
+                            static_cast<uint32_t>(kind), std::max(1u, count),
+                            MetadataStageBitFor(stage), flags, true});
+  return &facts.Bindings.back();
+}
+
+uint32_t DxilScalarByteSize(const llvm::Type *type) noexcept {
+  if (type == nullptr)
+    return 0;
+  if (type->isIntegerTy())
+    return std::max(1u, type->getIntegerBitWidth() / 8u);
+  if (type->isHalfTy())
+    return 2;
+  if (type->isFloatTy())
+    return 4;
+  if (type->isDoubleTy())
+    return 8;
+  return 0;
+}
+
+uint32_t DxilTypeSize(const llvm::Type *type,
+                      const hlsl::DxilTypeSystem &typeSystem) noexcept {
+  if (type == nullptr)
+    return 0;
+  if (const auto *structType = llvm::dyn_cast<llvm::StructType>(type)) {
+    const hlsl::DxilStructAnnotation *annotation =
+        typeSystem.GetStructAnnotation(structType);
+    if (annotation != nullptr && annotation->GetCBufferSize() != 0)
+      return annotation->GetCBufferSize();
+    uint32_t size = 0;
+    for (const llvm::Type *field : structType->elements())
+      size += DxilTypeSize(field, typeSystem);
+    return size;
+  }
+  if (const auto *arrayType = llvm::dyn_cast<llvm::ArrayType>(type))
+    return DxilTypeSize(arrayType->getElementType(), typeSystem) *
+           static_cast<uint32_t>(arrayType->getNumElements());
+  if (const auto *vectorType = llvm::dyn_cast<llvm::VectorType>(type))
+    return DxilScalarByteSize(vectorType->getElementType()) *
+           static_cast<uint32_t>(vectorType->getNumElements());
+  return DxilScalarByteSize(type);
+}
+
+uint32_t DxilAnnotatedTypeSize(
+    const llvm::Type *type, const hlsl::DxilFieldAnnotation &fieldAnnotation,
+    const hlsl::DxilTypeSystem &typeSystem) noexcept {
+  if (fieldAnnotation.HasMatrixAnnotation()) {
+    const hlsl::DxilMatrixAnnotation &matrix =
+        fieldAnnotation.GetMatrixAnnotation();
+    const llvm::Type *elementType = type;
+    if (const auto *arrayType = llvm::dyn_cast<llvm::ArrayType>(elementType))
+      elementType = arrayType->getElementType();
+    if (const auto *vectorType = llvm::dyn_cast<llvm::VectorType>(elementType))
+      elementType = vectorType->getElementType();
+    const uint32_t scalarSize = DxilScalarByteSize(elementType);
+    const uint32_t registerCount =
+        matrix.Orientation == hlsl::MatrixOrientation::RowMajor
+            ? matrix.Rows
+            : matrix.Cols;
+    return registerCount * 16u * std::max(1u, scalarSize / 4u);
+  }
+  return DxilTypeSize(type, typeSystem);
+}
+
+void CollectReachableDxilStructs(
+    const llvm::Type *type, vector<const llvm::StructType *> &reachable) {
+  if (type == nullptr)
+    return;
+  if (const auto *arrayType = llvm::dyn_cast<llvm::ArrayType>(type)) {
+    CollectReachableDxilStructs(arrayType->getElementType(), reachable);
+    return;
+  }
+  const auto *structType = llvm::dyn_cast<llvm::StructType>(type);
+  if (structType == nullptr)
+    return;
+  if (std::find(reachable.begin(), reachable.end(), structType) !=
+      reachable.end())
+    return;
+  reachable.push_back(structType);
+  for (const llvm::Type *field : structType->elements())
+    CollectReachableDxilStructs(field, reachable);
+}
+
+uint32_t DxilFieldKind(const llvm::Type *type,
+                       const hlsl::DxilFieldAnnotation &annotation) noexcept {
+  if (annotation.HasMatrixAnnotation())
+    return 3u;
+  if (llvm::isa<llvm::StructType>(type))
+    return 4u;
+  if (llvm::isa<llvm::ArrayType>(type))
+    return 5u;
+  if (llvm::isa<llvm::VectorType>(type))
+    return 2u;
+  return 1u;
 }
 
 bool ResolveMetadataTypeIndices(vector<MetadataTypeFact> &types) {
@@ -1321,239 +1202,612 @@ bool ResolveMetadataTypeIndices(vector<MetadataTypeFact> &types) {
   return true;
 }
 
-bool ParseMetadataRootConstants(string_view source,
-                                const vector<MetadataStageSpan> &stages,
-                                RadRayDxcTarget target,
-                                MetadataFacts &facts) {
-  if (target == RadRayDxcTarget::DXIL) {
-    size_t cursor = 0;
-    while ((cursor = source.find("RootConstants(", cursor)) !=
-           string_view::npos) {
-      const size_t begin = cursor + 14;
-      const size_t end = source.find(')', begin);
-      if (end == string_view::npos)
-        return false;
-      const string_view args = source.substr(begin, end - begin);
-      const size_t countPosition = args.find("num32BitConstants=");
-      const size_t registerPosition = args.find('b');
-      const size_t spacePosition = args.find("space=");
-      if (countPosition == string_view::npos ||
-          registerPosition == string_view::npos ||
-          spacePosition == string_view::npos)
-        return false;
-      size_t countCursor = countPosition + 18;
-      size_t registerCursor = registerPosition + 1;
-      size_t spaceCursor = spacePosition + 6;
-      uint32_t count = 0;
-      uint32_t binding = 0;
-      uint32_t group = 0;
-      if (!MetadataParseUnsigned(args, countCursor, count) ||
-          !MetadataParseUnsigned(args, registerCursor, binding) ||
-          !MetadataParseUnsigned(args, spaceCursor, group) || count == 0)
-        return false;
-      uint32_t stageMask = 0;
-      for (const MetadataStageSpan &stage : stages)
-        stageMask |= MetadataStageBit(stage.Stage);
-      facts.RootConstants.push_back(
-          {group, binding, 0, count * 4, stageMask, 0});
-      cursor = end + 1;
-    }
-  }
-
-  if (target != RadRayDxcTarget::SPIRV)
-    return true;
-  uint32_t pushCount = 0;
-  size_t cursor = 0;
-  while ((cursor = source.find("vk::push_constant", cursor)) !=
-         string_view::npos) {
-    ++pushCount;
-    cursor += 18;
-  }
-  cursor = 0;
-  while ((cursor = source.find("VK_PUSH_CONSTANT", cursor)) !=
-         string_view::npos) {
-    ++pushCount;
-    cursor += 16;
-  }
-  if (pushCount == 0)
-    return true;
-  if (pushCount != 1 || !facts.RootConstants.empty())
-    return false;
-  uint32_t stageMask = 0;
-  for (const MetadataStageSpan &stage : stages)
-    stageMask |= MetadataStageBit(stage.Stage);
-  facts.RootConstants.push_back({0, 0, 0, 16, stageMask, 1});
-  return true;
-}
-
-bool BuildMetadataFacts(string_view source, const ContractData &contract,
-                        RadRayDxcTarget target, MetadataFacts &facts,
-                        vector<Diagnostic> &diagnostics) {
-  const string cleaned = CleanSource(source);
-  const vector<MetadataStageSpan> stages =
-      FindMetadataStageSpans(cleaned, contract);
-  if (stages.size() != contract.EntryPoints.size()) {
-    diagnostics.push_back(
-        {2101, "metadata builder could not locate every discovered entry point"});
-    return false;
-  }
-
-  string explicitRootSignature;
-  bool hasExplicitRootSignature = false;
-  if (target == RadRayDxcTarget::DXIL) {
-    for (const MetadataStageSpan &stage : stages) {
-      const string signature = FindMetadataRootSignature(cleaned, stage.Begin);
-      if (signature.empty())
-        continue;
-      if (!hasExplicitRootSignature) {
-        explicitRootSignature = signature;
-        hasExplicitRootSignature = true;
-      } else if (contract.Kind == ShaderKind::Graphics &&
-                 signature != explicitRootSignature) {
-        diagnostics.push_back(
-            {2105, "graphics stages declare different RootSignature attributes"});
-        return false;
-      }
-    }
-  }
-
-  vector<MetadataBindingFact> declarations;
-  uint32_t braceDepth = 0;
-  size_t lineStart = 0;
-  string pendingAttribute;
-  while (lineStart <= cleaned.size()) {
-    const size_t lineEnd = cleaned.find_first_of("\r\n", lineStart);
-    const size_t boundedEnd = lineEnd == string::npos ? cleaned.size() : lineEnd;
-    string line{Trim(string_view{cleaned}.substr(lineStart,
-                                                   boundedEnd - lineStart))};
-    if (line.find("VK_BINDING(") != string_view::npos ||
-        line.find("vk::binding(") != string_view::npos)
-      pendingAttribute += line;
-    for (const char character : line) {
-      if (character == '{')
-        ++braceDepth;
-      else if (character == '}' && braceDepth != 0)
-        --braceDepth;
-    }
-    if (braceDepth == 0 && line.find(';') != string_view::npos) {
-      if (!pendingAttribute.empty()) {
-        line = pendingAttribute + line;
-        pendingAttribute.clear();
-      }
-      MetadataBindingFact binding;
-      if (ParseMetadataResourceLine(line, target, binding))
-        declarations.push_back(std::move(binding));
-    }
-    if (lineEnd == string_view::npos)
+string DxilStructName(const llvm::StructType *type) {
+  string name = type->getName().str();
+  for (const string_view prefix : {string_view{"hostlayout.struct."},
+                                   string_view{"struct."},
+                                   string_view{"hostlayout."}}) {
+    if (name.compare(0, prefix.size(), prefix) == 0) {
+      name.erase(0, prefix.size());
       break;
-    lineStart = lineEnd + 1;
-    if (lineStart < cleaned.size() && cleaned[lineEnd] == '\r' &&
-        cleaned[lineStart] == '\n')
-      ++lineStart;
-  }
-
-  uint32_t nextBinding[4] = {};
-  for (MetadataBindingFact &declaration : declarations) {
-    uint32_t stageMask = 0;
-    for (const MetadataStageSpan &stage : stages) {
-      if (MetadataUsesIdentifier(
-              cleaned.substr(stage.Begin, stage.End - stage.Begin),
-              declaration.Name))
-        stageMask |= MetadataStageBit(stage.Stage);
-    }
-    if (stageMask == 0)
-      continue;
-    declaration.StageMask = stageMask;
-    if (!declaration.HasExplicitBinding) {
-      while (std::any_of(
-          declarations.begin(), declarations.end(),
-          [&](const MetadataBindingFact &value) noexcept {
-            return value.HasExplicitBinding &&
-                   value.RegisterClass == declaration.RegisterClass &&
-                   value.Group == declaration.Group &&
-                   value.Binding == nextBinding[declaration.RegisterClass];
-          }))
-        ++nextBinding[declaration.RegisterClass];
-      declaration.Binding = nextBinding[declaration.RegisterClass]++;
-    }
-    const auto existing = std::find_if(
-        facts.Bindings.begin(), facts.Bindings.end(),
-        [&](const MetadataBindingFact &value) noexcept {
-          return value.Name == declaration.Name;
-        });
-    if (existing != facts.Bindings.end()) {
-      diagnostics.push_back({2102, "duplicate active binding declaration"});
-      return false;
-    }
-    facts.Bindings.push_back(std::move(declaration));
-  }
-
-  if (hasExplicitRootSignature &&
-      !ValidateMetadataRootBindings(explicitRootSignature, facts.Bindings,
-                                    diagnostics))
-    return false;
-
-  const vector<MetadataStructDecl> structs = ParseMetadataStructs(cleaned);
-  vector<bool> visiting(structs.size(), false);
-  vector<MetadataLayoutInfo> layouts(structs.size());
-  for (size_t index = 0; index < structs.size(); ++index)
-    AddMetadataTypeFacts(structs, index, kMetadataNoParent, visiting, layouts,
-                         facts.Types);
-  if (!ResolveMetadataTypeIndices(facts.Types)) {
-    diagnostics.push_back({2107, "metadata type tree contains an unresolved struct reference"});
-    return false;
-  }
-  if (!ParseMetadataRootConstants(cleaned, stages, target, facts)) {
-    diagnostics.push_back(
-        {2103, "shader source contains an invalid push/root constant declaration"});
-    return false;
-  }
-  if (!BuildMetadataVertexInputs(cleaned, contract, facts, diagnostics))
-    return false;
-
-  vector<uint32_t> staticSamplerRegisters;
-  size_t staticSamplerCursor = 0;
-  while ((staticSamplerCursor = cleaned.find("StaticSampler(",
-                                             staticSamplerCursor)) !=
-         string_view::npos) {
-    size_t registerCursor = staticSamplerCursor + 14;
-    registerCursor = MetadataSkipSpace(cleaned, registerCursor);
-    if (registerCursor >= cleaned.size() || cleaned[registerCursor] != 's') {
-      diagnostics.push_back({2104, "static sampler declaration is malformed"});
-      return false;
-    }
-    ++registerCursor;
-    uint32_t registerIndex = 0;
-    if (!MetadataParseUnsigned(cleaned, registerCursor, registerIndex) ||
-        std::find(staticSamplerRegisters.begin(), staticSamplerRegisters.end(),
-                  registerIndex) != staticSamplerRegisters.end()) {
-      diagnostics.push_back(
-          {2104, "static sampler register is duplicated or malformed"});
-      return false;
-    }
-    staticSamplerRegisters.push_back(registerIndex);
-    staticSamplerCursor = registerCursor;
-  }
-  const size_t activeSamplerCount = static_cast<size_t>(std::count_if(
-      facts.Bindings.begin(), facts.Bindings.end(),
-      [](const MetadataBindingFact &binding) noexcept {
-        return binding.Type ==
-               static_cast<uint32_t>(MetadataBindingKind::Sampler);
-      }));
-  if (staticSamplerRegisters.size() > activeSamplerCount) {
-    diagnostics.push_back(
-        {2104, "static sampler has no matching active sampler declaration"});
-    return false;
-  }
-  if (!staticSamplerRegisters.empty()) {
-    for (MetadataBindingFact &binding : facts.Bindings) {
-      if (binding.Type ==
-          static_cast<uint32_t>(MetadataBindingKind::Sampler))
-        binding.Flags |= kMetadataImmutableSampler;
     }
   }
-  return true;
+  return name;
 }
+
+void CollectDxilTypeFacts(const hlsl::DxilTypeSystem &typeSystem,
+                          const llvm::StructType *root,
+                          MetadataFacts &facts) {
+  vector<const llvm::StructType *> ordered;
+  const auto collectType = [&](const llvm::Type *type, const auto &self) -> void {
+    if (const auto *array = llvm::dyn_cast<llvm::ArrayType>(type)) {
+      self(array->getElementType(), self);
+      return;
+    }
+    const auto *structure = llvm::dyn_cast<llvm::StructType>(type);
+    if (structure == nullptr ||
+        std::find(ordered.begin(), ordered.end(), structure) != ordered.end())
+      return;
+    for (const llvm::Type *field : structure->elements())
+      self(field, self);
+    ordered.push_back(structure);
+  };
+  collectType(root, collectType);
+
+  for (const llvm::StructType *type : ordered) {
+    const hlsl::DxilStructAnnotation *annotation =
+        typeSystem.GetStructAnnotation(type);
+    const uint32_t size = annotation != nullptr && annotation->GetCBufferSize() != 0
+                              ? annotation->GetCBufferSize()
+                              : DxilTypeSize(type, typeSystem);
+    const uint32_t parentIndex = static_cast<uint32_t>(facts.Types.size());
+    facts.Types.push_back({DxilStructName(type), kMetadataNoParent, 4u, 1u,
+                           0u, size, size, 0u, kMetadataNoType, {}});
+    const uint32_t parentSize = facts.Types[parentIndex].Size;
+    vector<uint32_t> offsets;
+    offsets.reserve(type->getNumElements());
+    uint32_t runningOffset = 0;
+    for (uint32_t fieldIndex = 0; fieldIndex < type->getNumElements();
+         ++fieldIndex) {
+      const hlsl::DxilFieldAnnotation *fieldAnnotation = nullptr;
+      if (annotation != nullptr && fieldIndex < annotation->GetNumFields())
+        fieldAnnotation = &annotation->GetFieldAnnotation(fieldIndex);
+      uint32_t offset = runningOffset;
+      if (fieldAnnotation != nullptr && fieldAnnotation->HasCBufferOffset())
+        offset = fieldAnnotation->GetCBufferOffset();
+      offsets.push_back(offset);
+      runningOffset = offset + DxilTypeSize(type->getElementType(fieldIndex),
+                                            typeSystem);
+    }
+    for (uint32_t fieldIndex = 0; fieldIndex < type->getNumElements();
+         ++fieldIndex) {
+      const hlsl::DxilFieldAnnotation *fieldAnnotation = nullptr;
+      if (annotation != nullptr && fieldIndex < annotation->GetNumFields())
+        fieldAnnotation = &annotation->GetFieldAnnotation(fieldIndex);
+      hlsl::DxilFieldAnnotation emptyAnnotation;
+      if (fieldAnnotation == nullptr)
+        fieldAnnotation = &emptyAnnotation;
+      const llvm::Type *fieldType = type->getElementType(fieldIndex);
+      const uint32_t offset = offsets[fieldIndex];
+      const uint32_t nextOffset = fieldIndex + 1 < offsets.size()
+                                      ? offsets[fieldIndex + 1]
+                                      : parentSize;
+      const uint32_t size = nextOffset >= offset
+                                ? nextOffset - offset
+                                : DxilAnnotatedTypeSize(fieldType,
+                                                        *fieldAnnotation,
+                                                        typeSystem);
+      uint32_t stride = DxilAnnotatedTypeSize(fieldType, *fieldAnnotation,
+                                               typeSystem);
+      uint32_t elementCount = 1;
+      string underlying;
+      uint32_t kind = DxilFieldKind(fieldType, *fieldAnnotation);
+      if (kind == 3u)
+        stride = size;
+      if (const auto *arrayType = llvm::dyn_cast<llvm::ArrayType>(fieldType)) {
+        elementCount = static_cast<uint32_t>(arrayType->getNumElements());
+        stride = DxilTypeSize(arrayType->getElementType(), typeSystem);
+        if (const auto *elementStruct =
+                llvm::dyn_cast<llvm::StructType>(arrayType->getElementType()))
+          underlying = DxilStructName(elementStruct);
+      } else if (const auto *fieldStruct =
+                     llvm::dyn_cast<llvm::StructType>(fieldType)) {
+        underlying = DxilStructName(fieldStruct);
+      }
+      if (kind == 3u) {
+        elementCount = 1u;
+        stride = size;
+      }
+      string name = fieldAnnotation->HasFieldName()
+                        ? fieldAnnotation->GetFieldName()
+                        : ("field" + std::to_string(fieldIndex));
+      facts.Types.push_back({std::move(name), parentIndex, kind, elementCount,
+                             offset, size, stride, 0u, kMetadataNoType,
+                             std::move(underlying)});
+    }
+  }
+
+  ResolveMetadataTypeIndices(facts.Types);
+}
+
+uint32_t DxilRegisterClass(hlsl::DXIL::ResourceClass resourceClass) noexcept {
+  switch (resourceClass) {
+  case hlsl::DXIL::ResourceClass::CBuffer:
+    return 0;
+  case hlsl::DXIL::ResourceClass::SRV:
+    return 1;
+  case hlsl::DXIL::ResourceClass::UAV:
+    return 2;
+  case hlsl::DXIL::ResourceClass::Sampler:
+    return 3;
+  }
+  return 0xffffffffu;
+}
+
+MetadataBindingKind DxilBindingKind(const hlsl::DxilResourceBase &resource) {
+  if (resource.GetClass() == hlsl::DXIL::ResourceClass::CBuffer)
+    return MetadataBindingKind::CBuffer;
+  if (resource.GetClass() == hlsl::DXIL::ResourceClass::Sampler)
+    return MetadataBindingKind::Sampler;
+  const auto kind = resource.GetKind();
+  const bool texture = hlsl::DxilResource::IsAnyTexture(kind);
+  const bool rw = resource.GetClass() == hlsl::DXIL::ResourceClass::UAV;
+  if (rw)
+    return texture ? MetadataBindingKind::RWTexture
+                   : MetadataBindingKind::RWBuffer;
+  return texture ? MetadataBindingKind::Texture : MetadataBindingKind::Buffer;
+}
+
+void AddDxilResourceFact(const hlsl::DxilResourceBase &resource,
+                         MetadataFacts &facts, ShaderStage stage) {
+  const uint32_t registerClass = DxilRegisterClass(resource.GetClass());
+  if (registerClass == 0xffffffffu)
+    return;
+  const MetadataBindingKind kind = DxilBindingKind(resource);
+  const bool hasExplicitBinding = resource.GetLowerBound() != UINT_MAX;
+  const uint32_t binding = hasExplicitBinding ? resource.GetLowerBound()
+                                               : resource.GetID();
+  const uint32_t group = resource.GetSpaceID() == UINT_MAX
+                             ? 0u
+                             : resource.GetSpaceID();
+  MetadataBindingFact *fact = AddMetadataBinding(
+      facts, resource.GetGlobalName(), group, binding, kind,
+      resource.GetRangeSize(), stage);
+  if (fact != nullptr) {
+    fact->RegisterClass = registerClass;
+    fact->HasExplicitBinding = hasExplicitBinding;
+  }
+}
+
+void AddDxilRootBinding(vector<MetadataRootBindingFact> &rootBindings,
+                        uint32_t registerClass, uint32_t binding,
+                        uint32_t group, uint32_t count = 1) {
+  const uint32_t boundedCount = std::min(count, kMaxCollectionCount);
+  for (uint32_t index = 0; index < std::max(1u, boundedCount); ++index)
+    rootBindings.push_back({registerClass, binding + index, group});
+}
+
+uint32_t DxilRootRangeClass(hlsl::DxilDescriptorRangeType type) noexcept {
+  switch (type) {
+  case hlsl::DxilDescriptorRangeType::CBV:
+    return 0;
+  case hlsl::DxilDescriptorRangeType::SRV:
+    return 1;
+  case hlsl::DxilDescriptorRangeType::UAV:
+    return 2;
+  case hlsl::DxilDescriptorRangeType::Sampler:
+    return 3;
+  default:
+    return 0xffffffffu;
+  }
+}
+
+void ValidateDxilRootSignature(const hlsl::DxilVersionedRootSignatureDesc &root,
+                               MetadataFacts &facts,
+                               ShaderStage stage,
+                               vector<Diagnostic> &diagnostics) {
+  vector<MetadataRootBindingFact> rootBindings;
+  vector<MetadataRootBindingFact> staticSamplerBindings;
+  const auto addParameter = [&](hlsl::DxilRootParameterType type,
+                                uint32_t registerClass, uint32_t binding,
+                                uint32_t group) {
+    if (type != hlsl::DxilRootParameterType::Constants32Bit)
+      AddDxilRootBinding(rootBindings, registerClass, binding, group);
+  };
+  const auto addRange = [&](const hlsl::DxilDescriptorRange &range) {
+    const uint32_t registerClass = DxilRootRangeClass(range.RangeType);
+    if (registerClass != 0xffffffffu)
+      AddDxilRootBinding(rootBindings, registerClass,
+                         range.BaseShaderRegister, range.RegisterSpace,
+                         range.NumDescriptors);
+  };
+  const auto addRange1 = [&](const hlsl::DxilDescriptorRange1 &range) {
+    const uint32_t registerClass = DxilRootRangeClass(range.RangeType);
+    if (registerClass != 0xffffffffu)
+      AddDxilRootBinding(rootBindings, registerClass,
+                         range.BaseShaderRegister, range.RegisterSpace,
+                         range.NumDescriptors);
+  };
+
+  if (root.Version == hlsl::DxilRootSignatureVersion::Version_1_1) {
+    const auto &desc = root.Desc_1_1;
+    for (uint32_t index = 0; index < desc.NumParameters; ++index) {
+      const hlsl::DxilRootParameter1 &parameter = desc.pParameters[index];
+      if (parameter.ParameterType == hlsl::DxilRootParameterType::DescriptorTable) {
+        for (uint32_t rangeIndex = 0;
+             rangeIndex < parameter.DescriptorTable.NumDescriptorRanges;
+             ++rangeIndex)
+          addRange1(parameter.DescriptorTable.pDescriptorRanges[rangeIndex]);
+      } else if (parameter.ParameterType ==
+                 hlsl::DxilRootParameterType::Constants32Bit) {
+        facts.RootConstants.push_back(
+            {parameter.Constants.RegisterSpace, parameter.Constants.ShaderRegister,
+             0u, parameter.Constants.Num32BitValues * 4u,
+             MetadataStageBitFor(stage), 0u});
+      } else {
+        const uint32_t registerClass =
+            parameter.ParameterType == hlsl::DxilRootParameterType::CBV
+                ? 0u
+                : parameter.ParameterType == hlsl::DxilRootParameterType::SRV
+                      ? 1u
+                      : 2u;
+        addParameter(parameter.ParameterType, registerClass,
+                     parameter.Descriptor.ShaderRegister,
+                     parameter.Descriptor.RegisterSpace);
+      }
+    }
+    for (uint32_t index = 0; index < desc.NumStaticSamplers; ++index) {
+      const auto &sampler = desc.pStaticSamplers[index];
+      AddDxilRootBinding(rootBindings, 3u, sampler.ShaderRegister,
+                         sampler.RegisterSpace);
+      AddDxilRootBinding(staticSamplerBindings, 3u, sampler.ShaderRegister,
+                         sampler.RegisterSpace);
+    }
+  } else {
+    const auto &desc = root.Desc_1_0;
+    for (uint32_t index = 0; index < desc.NumParameters; ++index) {
+      const hlsl::DxilRootParameter &parameter = desc.pParameters[index];
+      if (parameter.ParameterType == hlsl::DxilRootParameterType::DescriptorTable) {
+        for (uint32_t rangeIndex = 0;
+             rangeIndex < parameter.DescriptorTable.NumDescriptorRanges;
+             ++rangeIndex)
+          addRange(parameter.DescriptorTable.pDescriptorRanges[rangeIndex]);
+      } else if (parameter.ParameterType ==
+                 hlsl::DxilRootParameterType::Constants32Bit) {
+        facts.RootConstants.push_back(
+            {parameter.Constants.RegisterSpace, parameter.Constants.ShaderRegister,
+             0u, parameter.Constants.Num32BitValues * 4u,
+             MetadataStageBitFor(stage), 0u});
+      } else {
+        const uint32_t registerClass =
+            parameter.ParameterType == hlsl::DxilRootParameterType::CBV
+                ? 0u
+                : parameter.ParameterType == hlsl::DxilRootParameterType::SRV
+                      ? 1u
+                      : 2u;
+        addParameter(parameter.ParameterType, registerClass,
+                     parameter.Descriptor.ShaderRegister,
+                     parameter.Descriptor.RegisterSpace);
+      }
+    }
+    for (uint32_t index = 0; index < desc.NumStaticSamplers; ++index) {
+      const auto &sampler = desc.pStaticSamplers[index];
+      AddDxilRootBinding(rootBindings, 3u, sampler.ShaderRegister,
+                         sampler.RegisterSpace);
+      AddDxilRootBinding(staticSamplerBindings, 3u, sampler.ShaderRegister,
+                         sampler.RegisterSpace);
+    }
+  }
+
+  for (const MetadataBindingFact &binding : facts.Bindings) {
+    if (binding.RegisterClass != 3u)
+      continue;
+    const bool isStaticSampler = std::any_of(
+        staticSamplerBindings.begin(), staticSamplerBindings.end(),
+        [&](const MetadataRootBindingFact &rootBinding) noexcept {
+          return rootBinding.Group == binding.Group &&
+                 rootBinding.Binding == binding.Binding;
+        });
+    if (!isStaticSampler ||
+        std::find(facts.StaticSamplerNames.begin(),
+                  facts.StaticSamplerNames.end(),
+                  binding.Name) != facts.StaticSamplerNames.end())
+      continue;
+    facts.StaticSamplerNames.push_back(binding.Name);
+  }
+  facts.HasStaticSamplerPolicy = !staticSamplerBindings.empty();
+
+  for (const MetadataRootBindingFact &rootBinding : rootBindings) {
+    const auto found = std::find_if(
+        facts.RootBindings.begin(), facts.RootBindings.end(),
+        [&](const MetadataRootBindingFact &value) noexcept {
+          return value.RegisterClass == rootBinding.RegisterClass &&
+                 value.Group == rootBinding.Group &&
+                 value.Binding == rootBinding.Binding;
+        });
+    if (found != facts.RootBindings.end())
+      continue;
+    facts.RootBindings.push_back(rootBinding);
+  }
+
+  const auto hasDuplicateStaticSampler = [&]() noexcept {
+    for (size_t left = 0; left < rootBindings.size(); ++left)
+      for (size_t right = left + 1; right < rootBindings.size(); ++right)
+        if (rootBindings[left].RegisterClass == 3u &&
+            rootBindings[left].RegisterClass == rootBindings[right].RegisterClass &&
+            rootBindings[left].Group == rootBindings[right].Group &&
+            rootBindings[left].Binding == rootBindings[right].Binding)
+          return true;
+    return false;
+  };
+  if (hasDuplicateStaticSampler())
+    diagnostics.push_back({2104, "DXIL RootSignature contains duplicate static sampler"});
+}
+
+void RadRayContractCollector::CollectDxilModule(llvm::Module &module) {
+  hlsl::DxilModule &dxil = module.GetOrCreateDxilModule();
+  dxil.RemoveUnusedResources();
+  for (const auto &resource : dxil.GetCBuffers()) {
+    AddDxilResourceFact(*resource, _metadata, _stage);
+    const llvm::Type *resourceType = resource->GetHLSLType();
+    if (resourceType != nullptr && resourceType->isPointerTy())
+      resourceType = resourceType->getPointerElementType();
+    if (const auto *wrapper = llvm::dyn_cast_or_null<llvm::StructType>(resourceType)) {
+      if (wrapper->getName().startswith("hostlayout.") &&
+          wrapper->getNumElements() == 1)
+        resourceType = wrapper->getElementType(0);
+    }
+    if (const auto *type = llvm::dyn_cast<llvm::StructType>(resourceType))
+      CollectDxilTypeFacts(dxil.GetTypeSystem(), type, _metadata);
+  }
+  for (const auto &resource : dxil.GetSamplers())
+    AddDxilResourceFact(*resource, _metadata, _stage);
+  for (const auto &resource : dxil.GetSRVs())
+    AddDxilResourceFact(*resource, _metadata, _stage);
+  for (const auto &resource : dxil.GetUAVs())
+    AddDxilResourceFact(*resource, _metadata, _stage);
+
+  if (_stage == ShaderStage::Vertex) {
+    const hlsl::DxilSignature &input = dxil.GetInputSignature();
+    _metadata.VertexInputs.clear();
+    uint32_t fallbackLocation = 0;
+    for (const auto &element : input.GetElements()) {
+      const string semantic = element->GetSemanticName().str();
+      if (semantic.empty() || (semantic.size() >= 3 && semantic.compare(0, 3, "SV_") == 0))
+        continue;
+      const int startRow = element->GetStartRow();
+      const uint32_t location = startRow < 0
+                                    ? fallbackLocation
+                                    : static_cast<uint32_t>(startRow);
+      fallbackLocation = location + std::max(1u, element->GetRows());
+      uint32_t componentType = 0;
+      const hlsl::CompType component = element->GetCompType();
+      if (component.IsFloatTy())
+        componentType = 1;
+      else if (component.IsSIntTy())
+        componentType = 2;
+      else if (component.IsUIntTy())
+        componentType = 3;
+      if (componentType == 0)
+        continue;
+      _metadata.VertexInputs.push_back(
+          {semantic, element->GetSemanticStartIndex(), location,
+           componentType, std::max(1u, element->GetRows() * element->GetCols()), 0});
+    }
+  }
+
+  const vector<uint8_t> &serializedRoot = dxil.GetSerializedRootSignature();
+  if (serializedRoot.empty())
+    return;
+  _metadata.HasRootSignature = true;
+  _metadata.RootSignatureHash = Digest(serializedRoot, 0x52534947ull);
+  const hlsl::DxilVersionedRootSignatureDesc *root = nullptr;
+  hlsl::DeserializeRootSignature(serializedRoot.data(),
+                                 static_cast<uint32_t>(serializedRoot.size()),
+                                 &root);
+  if (root == nullptr) {
+    _diagnostics.push_back({2106, "DXIL RootSignature could not be decoded"});
+    return;
+  }
+  ValidateDxilRootSignature(*root, _metadata, _stage, _diagnostics);
+  hlsl::DeleteRootSignature(root);
+}
+
+#ifdef ENABLE_SPIRV_CODEGEN
+const clang::spirv::SpirvType *UnwrapSpirvPointer(
+    const clang::spirv::SpirvType *type) {
+  if (const auto *pointer = llvm::dyn_cast<clang::spirv::SpirvPointerType>(type))
+    return pointer->getPointeeType();
+  return type;
+}
+
+uint32_t SpirvTypeSize(const clang::spirv::SpirvType *type) {
+  type = UnwrapSpirvPointer(type);
+  if (type == nullptr)
+    return 0;
+  if (const auto *numerical = llvm::dyn_cast<clang::spirv::NumericalType>(type))
+    return std::max(1u, numerical->getBitwidth() / 8u);
+  if (llvm::isa<clang::spirv::BoolType>(type))
+    return 4;
+  if (const auto *vector = llvm::dyn_cast<clang::spirv::VectorType>(type))
+    return SpirvTypeSize(vector->getElementType()) * vector->getElementCount();
+  if (const auto *matrix = llvm::dyn_cast<clang::spirv::MatrixType>(type))
+    return SpirvTypeSize(matrix->getVecType()) * matrix->getVecCount();
+  if (const auto *array = llvm::dyn_cast<clang::spirv::ArrayType>(type))
+    return SpirvTypeSize(array->getElementType()) * array->getElementCount();
+  if (const auto *runtimeArray =
+          llvm::dyn_cast<clang::spirv::RuntimeArrayType>(type))
+    return runtimeArray->getStride().hasValue()
+               ? runtimeArray->getStride().getValue()
+               : SpirvTypeSize(runtimeArray->getElementType());
+  if (const auto *structure = llvm::dyn_cast<clang::spirv::StructType>(type)) {
+    uint32_t size = 0;
+    for (const auto &field : structure->getFields()) {
+      const uint32_t offset = field.offset.hasValue() ? field.offset.getValue() : size;
+      const uint32_t fieldSize = field.sizeInBytes.hasValue()
+                                     ? field.sizeInBytes.getValue()
+                                     : SpirvTypeSize(field.type);
+      size = std::max(size, offset + fieldSize);
+    }
+    return size;
+  }
+  return 0;
+}
+
+string SpirvStructName(const clang::spirv::StructType *structure) {
+  string name = structure->getStructName().str();
+  for (const string_view prefix : {string_view{"type.ConstantBuffer."},
+                                   string_view{"type."}}) {
+    if (name.compare(0, prefix.size(), prefix) == 0) {
+      name.erase(0, prefix.size());
+      break;
+    }
+  }
+  return name;
+}
+
+void CollectSpirvStructFacts(const clang::spirv::StructType *structure,
+                             MetadataFacts &facts) {
+  if (structure == nullptr)
+    return;
+  const auto existing = std::find_if(
+      facts.Types.begin(), facts.Types.end(),
+      [&](const MetadataTypeFact &fact) noexcept {
+        return fact.ParentIndex == kMetadataNoParent && fact.Kind == 4u &&
+               fact.Name == SpirvStructName(structure);
+      });
+  if (existing != facts.Types.end())
+    return;
+  for (const auto &field : structure->getFields()) {
+    const clang::spirv::SpirvType *fieldType =
+        UnwrapSpirvPointer(field.type);
+    if (const auto *array = llvm::dyn_cast<clang::spirv::ArrayType>(fieldType))
+      fieldType = array->getElementType();
+    else if (const auto *runtimeArray =
+                 llvm::dyn_cast<clang::spirv::RuntimeArrayType>(fieldType))
+      fieldType = runtimeArray->getElementType();
+    CollectSpirvStructFacts(
+        llvm::dyn_cast<clang::spirv::StructType>(fieldType), facts);
+  }
+  const uint32_t parentIndex = static_cast<uint32_t>(facts.Types.size());
+  const uint32_t size = SpirvTypeSize(structure);
+  facts.Types.push_back({SpirvStructName(structure), kMetadataNoParent,
+                         4u, 1u, 0u, size, size, 0u, kMetadataNoType, {}});
+  const auto fields = structure->getFields();
+  for (size_t fieldIndex = 0; fieldIndex < fields.size(); ++fieldIndex) {
+    const auto &field = fields[fieldIndex];
+    const clang::spirv::SpirvType *fieldType = field.type;
+    uint32_t kind = 1;
+    uint32_t count = 1;
+    uint32_t stride = SpirvTypeSize(fieldType);
+    string underlying;
+    if (field.matrixStride.hasValue() &&
+        llvm::isa<clang::spirv::MatrixType>(fieldType)) {
+      kind = 3;
+      const auto *matrix = llvm::cast<clang::spirv::MatrixType>(fieldType);
+      stride = SpirvTypeSize(matrix);
+    } else if (const auto *array =
+                   llvm::dyn_cast<clang::spirv::ArrayType>(fieldType)) {
+      kind = 5;
+      count = array->getElementCount();
+      stride = array->getStride().hasValue()
+                   ? array->getStride().getValue()
+                   : SpirvTypeSize(array->getElementType());
+      if (const auto *elementStruct = llvm::dyn_cast<clang::spirv::StructType>(
+              array->getElementType()))
+        underlying = SpirvStructName(elementStruct);
+    } else if (const auto *fieldStruct =
+                   llvm::dyn_cast<clang::spirv::StructType>(fieldType)) {
+      kind = 4;
+      underlying = SpirvStructName(fieldStruct);
+    } else if (llvm::isa<clang::spirv::VectorType>(fieldType)) {
+      kind = 2;
+    }
+    const uint32_t offset = field.offset.hasValue() ? field.offset.getValue() : 0;
+    const uint32_t sizeInBytes = field.sizeInBytes.hasValue()
+                                     ? field.sizeInBytes.getValue()
+                                     : stride * count;
+    facts.Types.push_back({field.name, parentIndex, kind, count, offset,
+                           sizeInBytes, stride, 0u, kMetadataNoType,
+                           std::move(underlying)});
+  }
+  ResolveMetadataTypeIndices(facts.Types);
+}
+
+void RadRayContractCollector::CollectSpirvAction(
+    clang::EmitSpirvAction &action, string_view entryPointName) {
+  clang::spirv::SpirvEmitter *emitter = action.getSpirvEmitter();
+  if (emitter == nullptr || emitter->getSpirvBuilder().getModule() == nullptr)
+    return;
+  clang::spirv::SpirvModule *module = emitter->getSpirvBuilder().getModule();
+
+  vector<clang::spirv::SpirvVariable *> activeResources;
+  if (!entryPointName.empty()) {
+    RadRaySpirvEntryPointFinder entryFinder(entryPointName);
+    entryFinder.TraverseDecl(emitter->getASTContext().getTranslationUnitDecl());
+    if (entryFinder.EntryPoint() != nullptr) {
+      RadRaySpirvResourceUseVisitor resourceVisitor(
+          emitter->getDeclResultIdMapper(), activeResources);
+      resourceVisitor.TraverseEntry(entryFinder.EntryPoint());
+    }
+  }
+  for (clang::spirv::SpirvVariableLike *variableLike : module->getVariables()) {
+    auto *variable = llvm::dyn_cast<clang::spirv::SpirvVariable>(variableLike);
+    if (variable == nullptr)
+      continue;
+    const clang::spirv::SpirvType *valueType =
+        UnwrapSpirvPointer(variable->getResultType());
+    uint32_t count = 1;
+    while (const auto *array = llvm::dyn_cast<clang::spirv::ArrayType>(valueType)) {
+      count *= array->getElementCount();
+      valueType = array->getElementType();
+    }
+    const bool pushConstant =
+        variable->getStorageClass() == spv::StorageClass::PushConstant;
+    if (!entryPointName.empty() && !pushConstant &&
+        std::find(activeResources.begin(), activeResources.end(), variable) ==
+            activeResources.end())
+      continue;
+    const uint32_t stageMask = MetadataStageBitFor(_stage);
+    if (pushConstant) {
+      const uint32_t size = SpirvTypeSize(valueType);
+      if (!_sawPushConstant) {
+        _metadata.RootConstants.push_back({0u, 0u, 0u, size, stageMask, 1u});
+        _sawPushConstant = true;
+      } else {
+        _diagnostics.push_back(
+            {2103, "SPIR-V source contains multiple push constant blocks"});
+      }
+      if (const auto *structure =
+              llvm::dyn_cast<clang::spirv::StructType>(valueType))
+        CollectSpirvStructFacts(structure, _metadata);
+      continue;
+    }
+
+    MetadataBindingKind bindingKind{};
+    bool isBinding = variable->hasBinding();
+    if (clang::spirv::SpirvType::isSampler(valueType))
+      bindingKind = MetadataBindingKind::Sampler;
+    else if (clang::spirv::SpirvType::isRWTexture(valueType))
+      bindingKind = MetadataBindingKind::RWTexture;
+    else if (clang::spirv::SpirvType::isTexture(valueType))
+      bindingKind = MetadataBindingKind::Texture;
+    else if (clang::spirv::SpirvType::isRWBuffer(valueType))
+      bindingKind = MetadataBindingKind::RWBuffer;
+    else if (clang::spirv::SpirvType::isBuffer(valueType))
+      bindingKind = MetadataBindingKind::Buffer;
+    else if (llvm::isa<clang::spirv::StructType>(valueType)) {
+      const auto *structure = llvm::cast<clang::spirv::StructType>(valueType);
+      if (structure->getInterfaceType() ==
+              clang::spirv::StructInterfaceType::StorageBuffer &&
+          (variable->getStorageClass() == spv::StorageClass::Uniform ||
+           variable->getStorageClass() == spv::StorageClass::StorageBuffer))
+        bindingKind = structure->isReadOnly() ? MetadataBindingKind::Buffer
+                                              : MetadataBindingKind::RWBuffer;
+      else if (structure->getInterfaceType() ==
+                   clang::spirv::StructInterfaceType::UniformBuffer &&
+               variable->getStorageClass() == spv::StorageClass::Uniform)
+        bindingKind = MetadataBindingKind::CBuffer;
+    }
+    else
+      isBinding = false;
+    if (!isBinding)
+      continue;
+    const int32_t group = variable->getDescriptorSetNo();
+    const int32_t binding = variable->getBindingNo();
+    if (group < 0 || binding < 0)
+      continue;
+    AddMetadataBinding(_metadata, variable->getDebugName().str(),
+                       static_cast<uint32_t>(group),
+                       static_cast<uint32_t>(binding), bindingKind, count, _stage);
+    if (bindingKind == MetadataBindingKind::CBuffer) {
+      const auto *structure =
+          llvm::dyn_cast<clang::spirv::StructType>(valueType);
+      CollectSpirvStructFacts(structure, _metadata);
+    }
+  }
+}
+#endif
 
 Hash128 MakeContractHash(const ContractData &contract) {
   uint64_t first = 1469598103934665603ull;
@@ -1579,102 +1833,6 @@ Hash128 MakeContractHash(const ContractData &contract) {
     hash.Bytes[index + 8] = static_cast<uint8_t>(second >> (index * 8));
   }
   return hash;
-}
-
-bool DiscoverContract(string_view sourceName, const vector<uint8_t> &source,
-                      ContractData &contract, vector<Diagnostic> &diagnostics) {
-  if (!IsLogicalSourceName(sourceName) || source.empty()) {
-    diagnostics.push_back({1, "source name or source bytes are invalid"});
-    return false;
-  }
-  const string text(reinterpret_cast<const char *>(source.data()), source.size());
-  const string cleaned = CleanSource(text);
-  size_t lineStart = 0;
-  while (lineStart <= cleaned.size()) {
-    const size_t lineEnd = cleaned.find_first_of("\r\n", lineStart);
-    const size_t end = lineEnd == string::npos ? cleaned.size() : lineEnd;
-    const string_view line = string_view{cleaned}.substr(lineStart, end - lineStart);
-    if (line.find("#pragma radray_keyword_group") != string_view::npos) {
-      if (EndsWith(sourceName, ".hlsli") || IsConditionalAt(cleaned, lineStart)) {
-        diagnostics.push_back({6, "keyword group pragma must be in the root source outside conditions"});
-        return false;
-      }
-      KeywordGroup group;
-      if (!ParseKeywordPragma(line, group)) {
-        diagnostics.push_back({3, "keyword group pragma is malformed"});
-        return false;
-      }
-      std::sort(group.Values.begin(), group.Values.end());
-      for (const KeywordGroup &existing : contract.KeywordGroups) {
-        if (existing.Name == group.Name) {
-          diagnostics.push_back({4, "keyword group is declared more than once"});
-          return false;
-        }
-        for (const string &left : existing.Values) {
-          for (const string &right : group.Values) {
-            if (left == right) {
-              diagnostics.push_back({15, "keyword value is repeated across groups"});
-              return false;
-            }
-          }
-        }
-      }
-      for (size_t index = 1; index < group.Values.size(); ++index) {
-        if (group.Values[index - 1] == group.Values[index]) {
-          diagnostics.push_back({5, "keyword value is declared more than once"});
-          return false;
-        }
-      }
-      contract.KeywordGroups.push_back(std::move(group));
-    }
-    if (lineEnd == string::npos)
-      break;
-    lineStart = lineEnd + 1;
-    if (lineStart < cleaned.size() && cleaned[lineEnd] == '\r' && cleaned[lineStart] == '\n')
-      ++lineStart;
-  }
-  if (!ParseStageAttributes(cleaned, contract.EntryPoints, diagnostics))
-    return false;
-  uint32_t vertexCount = 0;
-  uint32_t pixelCount = 0;
-  uint32_t computeCount = 0;
-  for (const EntryPoint &entry : contract.EntryPoints) {
-    vertexCount += entry.Stage == ShaderStage::Vertex;
-    pixelCount += entry.Stage == ShaderStage::Pixel;
-    computeCount += entry.Stage == ShaderStage::Compute;
-  }
-  if (computeCount != 0 && (vertexCount != 0 || pixelCount != 0)) {
-    diagnostics.push_back({14, "graphics and compute entries cannot share a source unit"});
-    return false;
-  }
-  if (computeCount == 0 && vertexCount == 0) {
-    diagnostics.push_back({10, "graphics source has no vertex entry"});
-    return false;
-  }
-  if (computeCount == 0 && vertexCount > 1) {
-    diagnostics.push_back({11, "graphics source has multiple vertex entries"});
-    return false;
-  }
-  if (pixelCount > 1) {
-    diagnostics.push_back({12, "graphics source has multiple pixel entries"});
-    return false;
-  }
-  if (computeCount > 1) {
-    diagnostics.push_back({13, "compute source has multiple entries"});
-    return false;
-  }
-  contract.Kind = computeCount == 0 ? ShaderKind::Graphics : ShaderKind::Compute;
-  std::sort(contract.KeywordGroups.begin(), contract.KeywordGroups.end(),
-            [](const KeywordGroup &lhs, const KeywordGroup &rhs) {
-              return lhs.Name < rhs.Name;
-            });
-  std::sort(contract.EntryPoints.begin(), contract.EntryPoints.end(),
-            [](const EntryPoint &lhs, const EntryPoint &rhs) {
-              return std::make_pair(lhs.Stage, lhs.Name) <
-                     std::make_pair(rhs.Stage, rhs.Name);
-            });
-  contract.Hash = MakeContractHash(contract);
-  return true;
 }
 
 vector<uint8_t> EncodeContract(const ContractData &contract) {
@@ -1703,147 +1861,6 @@ vector<uint8_t> EncodeContract(const ContractData &contract) {
   return bytes;
 }
 
-bool IsMacroEnabled(const CompileRequest &request, RadRayDxcTarget target,
-                    string_view name) noexcept {
-  if (target == RadRayDxcTarget::SPIRV && name == "__spirv__")
-    return true;
-  for (const NameValue &define : request.Defines) {
-    if (define.Name == name)
-      return define.Value != "0";
-  }
-  for (const NameValue &assignment : request.Assignments) {
-    if (assignment.Name == name)
-      return assignment.Value != "0";
-  }
-  return false;
-}
-
-bool EvaluateCondition(string_view line, const CompileRequest &request,
-                       RadRayDxcTarget target, bool &value) noexcept {
-  line = Trim(line);
-  if (StartsWith(line, "#ifdef")) {
-    const string_view name = Trim(line.substr(6));
-    value = IsMacroEnabled(request, target, name);
-    return !name.empty();
-  }
-  if (StartsWith(line, "#ifndef")) {
-    const string_view name = Trim(line.substr(7));
-    value = !IsMacroEnabled(request, target, name);
-    return !name.empty();
-  }
-  if (StartsWith(line, "#if !defined(")) {
-    const size_t begin = line.find('(') + 1;
-    const size_t end = line.find(')', begin);
-    if (begin == 0 || end == string_view::npos)
-      return false;
-    value = !IsMacroEnabled(request, target, Trim(line.substr(begin, end - begin)));
-    return true;
-  }
-  if (StartsWith(line, "#if defined(")) {
-    const size_t begin = line.find('(') + 1;
-    const size_t end = line.find(')', begin);
-    if (begin == 0 || end == string_view::npos)
-      return false;
-    value = IsMacroEnabled(request, target, Trim(line.substr(begin, end - begin)));
-    return true;
-  }
-  return false;
-}
-
-string NormalizeInclude(string value) {
-  std::replace(value.begin(), value.end(), '\\', '/');
-  if (value.size() >= 2 && value.front() == '<' && value.back() == '>')
-    value = value.substr(1, value.size() - 2);
-  while (StartsWith(value, "./"))
-    value.erase(0, 2);
-  return value;
-}
-
-bool ExpandSourceInternal(string_view source, const CompileRequest &request,
-                          RadRayDxcTarget target, string &output,
-                          vector<IncludeSource> &opened, uint32_t depth) {
-  if (depth > kMaxRecursionDepth)
-    return false;
-  struct ConditionFrame {
-    bool ParentActive{true};
-    bool Condition{true};
-    bool ElseSeen{false};
-  };
-  vector<ConditionFrame> conditions;
-  bool active = true;
-  size_t lineStart = 0;
-  while (lineStart <= source.size()) {
-    const size_t lineEnd = source.find_first_of("\r\n", lineStart);
-    const size_t end = lineEnd == string_view::npos ? source.size() : lineEnd;
-    const string_view line = source.substr(lineStart, end - lineStart);
-    const string_view trimmed = Trim(line);
-    if (StartsWith(trimmed, "#if ") || StartsWith(trimmed, "#ifdef") ||
-        StartsWith(trimmed, "#ifndef")) {
-      bool condition = true;
-      EvaluateCondition(trimmed, request, target, condition);
-      conditions.push_back({active, condition, false});
-      active = active && condition;
-      output.append(line);
-    } else if (StartsWith(trimmed, "#else")) {
-      if (conditions.empty() || conditions.back().ElseSeen)
-        return false;
-      ConditionFrame &frame = conditions.back();
-      frame.ElseSeen = true;
-      active = frame.ParentActive && !frame.Condition;
-      output.append(line);
-    } else if (StartsWith(trimmed, "#endif")) {
-      if (conditions.empty())
-        return false;
-      const ConditionFrame frame = conditions.back();
-      conditions.pop_back();
-      active = frame.ParentActive;
-      output.append(line);
-    } else if (active && StartsWith(trimmed, "#include")) {
-      const size_t begin = trimmed.find_first_of("<\"");
-      if (begin == string_view::npos)
-        return false;
-      const char closing = trimmed[begin] == '<' ? '>' : '"';
-      const size_t endName = trimmed.find(closing, begin + 1);
-      if (endName == string_view::npos)
-        return false;
-      const IncludeSource *found = nullptr;
-      const string logicalName = NormalizeInclude(string{trimmed.substr(begin + 1, endName - begin - 1)});
-      for (const IncludeSource &include : request.Includes) {
-        if (include.Name == logicalName) {
-          found = &include;
-          break;
-        }
-      }
-      if (found == nullptr)
-        return false;
-      opened.push_back(*found);
-      string expanded;
-      if (!ExpandSourceInternal(
-              string_view{reinterpret_cast<const char *>(found->Bytes.data()), found->Bytes.size()},
-              request, target, expanded, opened, depth + 1)) {
-        return false;
-      }
-      output.append(expanded);
-    } else {
-      output.append(line);
-    }
-    if (lineEnd == string_view::npos)
-      break;
-    output.push_back('\n');
-    lineStart = lineEnd + 1;
-    if (lineStart < source.size() && source[lineEnd] == '\r' && source[lineStart] == '\n')
-      ++lineStart;
-  }
-  return conditions.empty();
-}
-
-bool ExpandSource(const CompileRequest &request, RadRayDxcTarget target,
-                  string &output, vector<IncludeSource> &opened) {
-  return ExpandSourceInternal(
-      string_view{reinterpret_cast<const char *>(request.RootSource.data()), request.RootSource.size()},
-      request, target, output, opened, 0);
-}
-
 const wchar_t *ProfileForStage(ShaderStage stage) noexcept {
   switch (stage) {
   case ShaderStage::Vertex:
@@ -1856,33 +1873,221 @@ const wchar_t *ProfileForStage(ShaderStage stage) noexcept {
   return L"";
 }
 
-wstring ToWide(string_view value) {
-  wstring result;
-  result.reserve(value.size());
-  for (const char character : value)
-    result.push_back(static_cast<wchar_t>(static_cast<unsigned char>(character)));
-  return result;
+bool ToWide(string_view value, wstring &result) {
+  if (value.size() >= static_cast<size_t>(std::numeric_limits<int>::max()))
+    return false;
+  return Unicode::UTF8ToWideString(value.data(), value.size(), &result);
+}
+
+bool AppendIncludePathArguments(
+    RadRayDxcIncludePathListView includePaths,
+    vector<wstring> &arguments,
+    string &error) {
+  if (includePaths.Count > kMaxCollectionCount ||
+      (includePaths.Count != 0 && includePaths.Paths == nullptr)) {
+    error = "include path list is invalid";
+    return false;
+  }
+  arguments.reserve(arguments.size() + static_cast<size_t>(includePaths.Count) * 2);
+  for (uint32_t index = 0; index < includePaths.Count; ++index) {
+    const RadRayDxcBlobView path = includePaths.Paths[index];
+    if (path.Data == nullptr || path.Size == 0 ||
+        path.Size >= static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+        std::memchr(path.Data, 0, path.Size) != nullptr) {
+      error = "include path contains an invalid UTF-8 blob";
+      return false;
+    }
+    const auto *data = reinterpret_cast<const char *>(path.Data);
+    wstring widePath;
+    if (!ToWide(string_view{data, path.Size}, widePath)) {
+      error = "include path is not valid UTF-8";
+      return false;
+    }
+    arguments.emplace_back(L"-I");
+    arguments.push_back(std::move(widePath));
+  }
+  return true;
+}
+
+bool CheckDxcResult(
+    const CComPtr<IDxcResult> &result,
+    uint32_t errorCode,
+    string_view fallback,
+    vector<Diagnostic> &diagnostics) {
+  HRESULT status = E_FAIL;
+  if (FAILED(result->GetStatus(&status)) || FAILED(status)) {
+    CComPtr<IDxcBlobUtf8> errors;
+    if (SUCCEEDED(result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr)) &&
+        errors != nullptr && errors->GetStringLength() != 0) {
+      const char *text = static_cast<const char *>(errors->GetBufferPointer());
+      diagnostics.push_back({errorCode, string{text, text + errors->GetStringLength()}});
+    } else {
+      diagnostics.push_back({errorCode, string{fallback}});
+    }
+    return false;
+  }
+  return true;
+}
+
+bool CollectContractWithFrontend(
+    const DiscoveryRequest &request, RadRayDxcTarget target,
+    RadRayDxcIncludePathListView includePaths, ContractData &contract,
+    vector<Diagnostic> &diagnostics) {
+  CComPtr<IDxcUtils> utils;
+  if (FAILED(CreateDxcUtils(IID_PPV_ARGS(&utils)))) {
+    diagnostics.push_back({2002, "fork DXC utils instance creation failed"});
+    return false;
+  }
+
+  vector<wstring> argumentStorage;
+  argumentStorage.emplace_back(L"-HV");
+  wstring hlslVersion;
+  if (!ToWide(std::to_string(request.HlslVersion), hlslVersion)) {
+    diagnostics.push_back({2000, "HLSL version argument is not valid UTF-8"});
+    return false;
+  }
+  argumentStorage.push_back(std::move(hlslVersion));
+  argumentStorage.emplace_back(L"-T");
+  argumentStorage.emplace_back(L"lib_6_1");
+  argumentStorage.emplace_back(L"-Vd");
+  if (request.AllResourcesBound != 0)
+    argumentStorage.emplace_back(L"-all_resources_bound");
+  if (target == RadRayDxcTarget::SPIRV) {
+    argumentStorage.emplace_back(L"-spirv");
+    argumentStorage.emplace_back(L"-fspv-target-env=vulkan1.2");
+  }
+  for (const NameValue &define : request.Defines) {
+    const string argument = "-D" + define.Name + "=" + define.Value;
+    wstring wideArgument;
+    if (!ToWide(argument, wideArgument)) {
+      diagnostics.push_back({2000, "define argument is not valid UTF-8"});
+      return false;
+    }
+    argumentStorage.push_back(std::move(wideArgument));
+  }
+  string pathError;
+  if (!AppendIncludePathArguments(includePaths, argumentStorage, pathError)) {
+    diagnostics.push_back({2000, std::move(pathError)});
+    return false;
+  }
+
+  vector<LPCWSTR> arguments;
+  arguments.reserve(argumentStorage.size());
+  for (const wstring &argument : argumentStorage)
+    arguments.push_back(argument.c_str());
+
+  wstring sourceNameWide;
+  if (!ToWide(request.SourceName, sourceNameWide)) {
+    diagnostics.push_back({2000, "source name is not valid UTF-8"});
+    return false;
+  }
+  CComPtr<IDxcCompilerArgs> compilerArgs;
+  if (FAILED(utils->BuildArguments(
+          sourceNameWide.c_str(), nullptr, nullptr, arguments.data(),
+          static_cast<uint32_t>(arguments.size()), nullptr, 0,
+          &compilerArgs))) {
+    diagnostics.push_back({2003, "fork DXC argument construction failed"});
+    return false;
+  }
+
+  CComPtr<IDxcIncludeHandler> includeHandler;
+  if (FAILED(utils->CreateDefaultIncludeHandler(&includeHandler))) {
+    diagnostics.push_back({2003, "fork DXC default include handler creation failed"});
+    return false;
+  }
+
+  DxcBuffer sourceBuffer{};
+  sourceBuffer.Ptr = request.RootSource.data();
+  sourceBuffer.Size = request.RootSource.size();
+  sourceBuffer.Encoding = DXC_CP_UTF8;
+  RadRayFrontendObserver observer(request.SourceName, target,
+                                  ShaderStage::Vertex, true);
+  CComPtr<IDxcResult> result;
+  if (FAILED(CompileDxcWithRadRayObserver(
+          &sourceBuffer, compilerArgs->GetArguments(), compilerArgs->GetCount(),
+          includeHandler.p, &observer, IID_PPV_ARGS(&result)))) {
+    diagnostics.push_back({2003, "fork DXC frontend contract call failed"});
+    return false;
+  }
+  if (!CheckDxcResult(result, 2004,
+                      "fork DXC rejected the frontend contract request",
+                      diagnostics))
+    return false;
+  return observer.Finalize(contract, diagnostics);
 }
 
 struct StageOutput {
   vector<uint8_t> Bytecode;
+  MetadataFacts Facts;
 };
 
+bool TryCollectDxilRootPolicy(const CompileRequest &request,
+                              const EntryPoint &entry, IDxcUtils *utils,
+                              IDxcIncludeHandler *includeHandler,
+                              const vector<wstring> &spirvArguments,
+                              MetadataFacts &facts) {
+  vector<wstring> argumentStorage;
+  argumentStorage.reserve(spirvArguments.size());
+  for (const wstring &argument : spirvArguments) {
+    if (argument == L"-spirv" ||
+        argument == L"-fspv-target-env=vulkan1.2")
+      continue;
+    argumentStorage.push_back(argument);
+  }
+  vector<LPCWSTR> arguments;
+  arguments.reserve(argumentStorage.size());
+  for (const wstring &argument : argumentStorage)
+    arguments.push_back(argument.c_str());
+
+  wstring sourceName;
+  wstring entryName;
+  if (!ToWide(request.SourceName, sourceName) ||
+      !ToWide(entry.Name, entryName))
+    return false;
+  CComPtr<IDxcCompilerArgs> compilerArgs;
+  if (FAILED(utils->BuildArguments(
+          sourceName.c_str(), entryName.c_str(), ProfileForStage(entry.Stage),
+          arguments.data(), static_cast<uint32_t>(arguments.size()), nullptr, 0,
+          &compilerArgs)))
+    return false;
+
+  DxcBuffer source{};
+  source.Ptr = request.RootSource.data();
+  source.Size = request.RootSource.size();
+  source.Encoding = DXC_CP_UTF8;
+  RadRayFrontendObserver observer(request.SourceName, RadRayDxcTarget::DXIL,
+                                   entry.Stage);
+  CComPtr<IDxcResult> result;
+  if (FAILED(CompileDxcWithRadRayObserver(
+          &source, compilerArgs->GetArguments(), compilerArgs->GetCount(),
+          includeHandler, &observer, IID_PPV_ARGS(&result))))
+    return false;
+  vector<Diagnostic> ignoredDiagnostics;
+  if (!CheckDxcResult(result, 2004,
+                      "fork DXC rejected the DXIL root policy probe",
+                      ignoredDiagnostics))
+    return false;
+  facts = observer.Metadata();
+  return facts.HasRootSignature;
+}
+
 bool CompileStage(const CompileRequest &request, RadRayDxcTarget target,
-                  const EntryPoint &entry, string_view expandedSource,
+                  const EntryPoint &entry,
+                  RadRayDxcIncludePathListView includePaths,
                   StageOutput &output, vector<Diagnostic> &diagnostics) {
-  CComPtr<IDxcCompiler3> compiler;
-  if (FAILED(CreateDxcCompiler(IID_PPV_ARGS(&compiler)))) {
-    diagnostics.push_back({2002, "fork DXC compiler instance creation failed"});
+  CComPtr<IDxcUtils> utils;
+  if (FAILED(CreateDxcUtils(IID_PPV_ARGS(&utils)))) {
+    diagnostics.push_back({2002, "fork DXC utils instance creation failed"});
     return false;
   }
   vector<wstring> argumentStorage;
-  argumentStorage.emplace_back(L"-E");
-  argumentStorage.emplace_back(ToWide(entry.Name));
-  argumentStorage.emplace_back(L"-T");
-  argumentStorage.emplace_back(ProfileForStage(entry.Stage));
   argumentStorage.emplace_back(L"-HV");
-  argumentStorage.emplace_back(ToWide(std::to_string(request.HlslVersion)));
+  wstring hlslVersion;
+  if (!ToWide(std::to_string(request.HlslVersion), hlslVersion)) {
+    diagnostics.push_back({2000, "HLSL version argument is not valid UTF-8"});
+    return false;
+  }
+  argumentStorage.push_back(std::move(hlslVersion));
   argumentStorage.emplace_back(request.Optimize != 0 ? L"-O3" : L"-Od");
   if (request.DebugInfo != 0)
     argumentStorage.emplace_back(L"-Zi");
@@ -1892,36 +2097,67 @@ bool CompileStage(const CompileRequest &request, RadRayDxcTarget target,
     argumentStorage.emplace_back(L"-spirv");
     argumentStorage.emplace_back(L"-fspv-target-env=vulkan1.2");
   }
-  for (const NameValue &define : request.Defines)
-    argumentStorage.emplace_back(ToWide("-D" + define.Name + "=" + define.Value));
-  for (const NameValue &assignment : request.Assignments)
-    argumentStorage.emplace_back(ToWide("-D" + assignment.Name + "=" + assignment.Value));
+  for (const NameValue &define : request.Defines) {
+    const string argument = "-D" + define.Name + "=" + define.Value;
+    wstring wideArgument;
+    if (!ToWide(argument, wideArgument)) {
+      diagnostics.push_back({2000, "define argument is not valid UTF-8"});
+      return false;
+    }
+    argumentStorage.push_back(std::move(wideArgument));
+  }
+  for (const NameValue &assignment : request.Assignments) {
+    const string argument = "-D" + assignment.Name + "=" + assignment.Value;
+    wstring wideArgument;
+    if (!ToWide(argument, wideArgument)) {
+      diagnostics.push_back({2000, "keyword assignment argument is not valid UTF-8"});
+      return false;
+    }
+    argumentStorage.push_back(std::move(wideArgument));
+  }
+  string pathError;
+  if (!AppendIncludePathArguments(includePaths, argumentStorage, pathError)) {
+    diagnostics.push_back({2000, std::move(pathError)});
+    return false;
+  }
   vector<LPCWSTR> arguments;
   arguments.reserve(argumentStorage.size());
   for (const wstring &argument : argumentStorage)
     arguments.push_back(argument.c_str());
 
+  wstring sourceName;
+  wstring entryName;
+  if (!ToWide(request.SourceName, sourceName) || !ToWide(entry.Name, entryName)) {
+    diagnostics.push_back({2000, "source or entry name is not valid UTF-8"});
+    return false;
+  }
+  CComPtr<IDxcCompilerArgs> compilerArgs;
+  if (FAILED(utils->BuildArguments(
+          sourceName.c_str(), entryName.c_str(), ProfileForStage(entry.Stage),
+          arguments.data(), static_cast<uint32_t>(arguments.size()), nullptr, 0,
+          &compilerArgs))) {
+    diagnostics.push_back({2003, "fork DXC argument construction failed"});
+    return false;
+  }
+  CComPtr<IDxcIncludeHandler> includeHandler;
+  if (FAILED(utils->CreateDefaultIncludeHandler(&includeHandler))) {
+    diagnostics.push_back({2003, "fork DXC default include handler creation failed"});
+    return false;
+  }
   DxcBuffer source{};
-  source.Ptr = expandedSource.data();
-  source.Size = expandedSource.size();
+  source.Ptr = request.RootSource.data();
+  source.Size = request.RootSource.size();
   source.Encoding = DXC_CP_UTF8;
+  RadRayFrontendObserver observer(request.SourceName, target, entry.Stage,
+                                  false, entry.Name);
   CComPtr<IDxcResult> result;
-  if (FAILED(compiler->Compile(
-          &source, arguments.data(), static_cast<uint32_t>(arguments.size()), nullptr,
-          IID_PPV_ARGS(&result)))) {
+  if (FAILED(CompileDxcWithRadRayObserver(
+          &source, compilerArgs->GetArguments(), compilerArgs->GetCount(),
+          includeHandler.p, &observer, IID_PPV_ARGS(&result)))) {
     diagnostics.push_back({2003, "fork DXC Compile call failed"});
     return false;
   }
-  HRESULT status = E_FAIL;
-  if (FAILED(result->GetStatus(&status)) || FAILED(status)) {
-    CComPtr<IDxcBlobUtf8> errors;
-    if (SUCCEEDED(result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr)) &&
-        errors != nullptr && errors->GetStringLength() != 0) {
-      const char *text = static_cast<const char *>(errors->GetBufferPointer());
-      diagnostics.push_back({2004, string{text, text + errors->GetStringLength()}});
-    } else {
-      diagnostics.push_back({2004, "fork DXC rejected the typed compile request"});
-    }
+  if (!CheckDxcResult(result, 2004, "fork DXC rejected the typed compile request", diagnostics)) {
     return false;
   }
   CComPtr<IDxcBlob> object;
@@ -1932,6 +2168,33 @@ bool CompileStage(const CompileRequest &request, RadRayDxcTarget target,
   }
   const auto *data = static_cast<const uint8_t *>(object->GetBufferPointer());
   output.Bytecode.assign(data, data + object->GetBufferSize());
+
+  output.Facts = observer.Metadata();
+  if (target == RadRayDxcTarget::SPIRV) {
+    MetadataFacts dxilRootPolicy;
+    const bool hasRootPolicy =
+        TryCollectDxilRootPolicy(request, entry, utils.p, includeHandler.p,
+                                 argumentStorage, dxilRootPolicy);
+    if (hasRootPolicy &&
+        dxilRootPolicy.HasStaticSamplerPolicy) {
+      output.Facts.HasStaticSamplerPolicy = true;
+      for (const string &name : dxilRootPolicy.StaticSamplerNames)
+        if (std::find(output.Facts.StaticSamplerNames.begin(),
+                      output.Facts.StaticSamplerNames.end(),
+                      name) == output.Facts.StaticSamplerNames.end())
+          output.Facts.StaticSamplerNames.push_back(name);
+      for (MetadataBindingFact &binding : output.Facts.Bindings) {
+        if (binding.Type !=
+            static_cast<uint32_t>(MetadataBindingKind::Sampler))
+          continue;
+        if (dxilRootPolicy.StaticSamplerNames.empty() ||
+            std::find(dxilRootPolicy.StaticSamplerNames.begin(),
+                      dxilRootPolicy.StaticSamplerNames.end(),
+                      binding.Name) != dxilRootPolicy.StaticSamplerNames.end())
+          binding.Flags |= kMetadataImmutableSampler;
+      }
+    }
+  }
   return true;
 }
 
@@ -1957,7 +2220,6 @@ struct WireEnvelope {
   WireRange Bytecode;
   uint64_t ToolchainIdentity;
   uint8_t Contract[16];
-  uint8_t CompileInput[16];
   uint8_t BytecodeDigest[16];
   uint8_t PipelineLayoutDigest[16];
   uint8_t GpuArtifact[16];
@@ -2014,61 +2276,208 @@ struct WireVertexInputRecord {
 };
 #pragma pack(pop)
 
-static_assert(sizeof(WireEnvelope) == 152);
+static_assert(sizeof(WireEnvelope) == 136);
 static_assert(sizeof(WireEntryRecord) == 24);
 static_assert(sizeof(WireBindingRecord) == 32);
 static_assert(sizeof(WireTypeRecord) == 40);
 static_assert(sizeof(WireRootConstantRecord) == 24);
 static_assert(sizeof(WireVertexInputRecord) == 28);
 
-vector<uint8_t> EncodeCompileInput(const CompileRequest &request,
-                                   RadRayDxcTarget target,
-                                   const vector<IncludeSource> &opened) {
-  vector<uint8_t> bytes;
-  AppendU32(bytes, radray::shader::kRadRayDxcShaderWireMagic);
-  AppendU16(bytes, radray::shader::kRadRayDxcShaderWireSchemaVersion);
-  AppendString(bytes, request.SourceName);
-  AppendU32(bytes, static_cast<uint32_t>(request.RootSource.size()));
-  AppendBytes(bytes, request.RootSource);
-  AppendU32(bytes, static_cast<uint32_t>(opened.size()));
-  for (const IncludeSource &include : opened) {
-    AppendString(bytes, include.Name);
-    AppendU32(bytes, static_cast<uint32_t>(include.Bytes.size()));
-    AppendBytes(bytes, include.Bytes);
+bool MergeMetadataFacts(const ContractData &contract,
+                        RadRayDxcTarget target,
+                        const vector<StageOutput> &stages,
+                        MetadataFacts &facts,
+                        vector<Diagnostic> &diagnostics) {
+  facts = {};
+  for (const StageOutput &stage : stages) {
+    const MetadataFacts &source = stage.Facts;
+    if (source.HasStaticSamplerPolicy) {
+      facts.HasStaticSamplerPolicy = true;
+      for (const string &name : source.StaticSamplerNames)
+        if (std::find(facts.StaticSamplerNames.begin(),
+                      facts.StaticSamplerNames.end(), name) ==
+            facts.StaticSamplerNames.end())
+          facts.StaticSamplerNames.push_back(name);
+    }
+    if (source.HasRootSignature) {
+      if (facts.HasRootSignature &&
+          !(facts.RootSignatureHash == source.RootSignatureHash)) {
+        diagnostics.push_back(
+            {2105, "graphics stages declare different RootSignature attributes"});
+        return false;
+      }
+      facts.HasRootSignature = true;
+      facts.RootSignatureHash = source.RootSignatureHash;
+    }
+
+    for (const MetadataRootBindingFact &rootBinding : source.RootBindings) {
+      const auto found = std::find_if(
+          facts.RootBindings.begin(), facts.RootBindings.end(),
+          [&](const MetadataRootBindingFact &value) noexcept {
+            return value.RegisterClass == rootBinding.RegisterClass &&
+                   value.Group == rootBinding.Group &&
+                   value.Binding == rootBinding.Binding;
+          });
+      if (found == facts.RootBindings.end())
+        facts.RootBindings.push_back(rootBinding);
+    }
+
+    for (const MetadataBindingFact &binding : source.Bindings) {
+      const auto found = std::find_if(
+          facts.Bindings.begin(), facts.Bindings.end(),
+          [&](const MetadataBindingFact &value) noexcept {
+            return value.Name == binding.Name;
+          });
+      if (found == facts.Bindings.end()) {
+        facts.Bindings.push_back(binding);
+      } else if (found->Group != binding.Group ||
+                 found->Binding != binding.Binding ||
+                 found->Type != binding.Type ||
+                 found->Count != binding.Count) {
+        diagnostics.push_back({2109, "frontend stages disagree on a resource binding"});
+        return false;
+      } else {
+        found->StageMask |= binding.StageMask;
+        found->Flags |= binding.Flags;
+      }
+    }
+
+    if (facts.Types.empty()) {
+      facts.Types = source.Types;
+    } else if (!source.Types.empty()) {
+      if (facts.Types.size() != source.Types.size()) {
+        diagnostics.push_back({2107, "frontend stages disagree on type metadata"});
+        return false;
+      }
+      for (size_t index = 0; index < facts.Types.size(); ++index) {
+        const MetadataTypeFact &left = facts.Types[index];
+        const MetadataTypeFact &right = source.Types[index];
+        if (left.Name != right.Name || left.ParentIndex != right.ParentIndex ||
+            left.Kind != right.Kind || left.ElementCount != right.ElementCount ||
+            left.Offset != right.Offset || left.Size != right.Size ||
+            left.Stride != right.Stride || left.TypeIndex != right.TypeIndex) {
+          diagnostics.push_back({2107, "frontend stages disagree on type metadata"});
+          return false;
+        }
+      }
+    }
+
+    for (const MetadataRootConstantFact &constant : source.RootConstants) {
+      const auto found = std::find_if(
+          facts.RootConstants.begin(), facts.RootConstants.end(),
+          [&](const MetadataRootConstantFact &value) noexcept {
+            return value.RegisterSpace == constant.RegisterSpace &&
+                   value.Register == constant.Register &&
+                   value.Offset == constant.Offset && value.Size == constant.Size &&
+                   value.Flags == constant.Flags;
+          });
+      if (found == facts.RootConstants.end())
+        facts.RootConstants.push_back(constant);
+      else
+        found->StageMask |= constant.StageMask;
+    }
+
+    for (const MetadataVertexInputFact &input : source.VertexInputs) {
+      const auto found = std::find_if(
+          facts.VertexInputs.begin(), facts.VertexInputs.end(),
+          [&](const MetadataVertexInputFact &value) noexcept {
+            return value.Semantic == input.Semantic &&
+                   value.SemanticIndex == input.SemanticIndex;
+          });
+      if (found == facts.VertexInputs.end())
+        facts.VertexInputs.push_back(input);
+      else if (found->Location != input.Location ||
+               found->ComponentType != input.ComponentType ||
+               found->ComponentCount != input.ComponentCount) {
+        diagnostics.push_back({2108, "frontend stages disagree on vertex input metadata"});
+        return false;
+      }
+    }
   }
-  AppendByte(bytes, target == RadRayDxcTarget::DXIL ? 1 : 2);
-  AppendU32(bytes, request.ShaderModel);
-  AppendByte(bytes, request.Optimize);
-  AppendByte(bytes, request.DebugInfo);
-  AppendByte(bytes, request.AllResourcesBound);
-  AppendByte(bytes, request.WarningPolicy);
-  AppendU32(bytes, request.SpirvTargetEnv);
-  AppendU32(bytes, request.HlslVersion);
-  AppendU32(bytes, request.Reserved);
-  bytes.insert(bytes.end(), 16, 0);
-  AppendU32(bytes, static_cast<uint32_t>(request.Defines.size()));
-  for (const NameValue &define : request.Defines) {
-    AppendString(bytes, define.Name);
-    AppendString(bytes, define.Value);
+
+  if (target == RadRayDxcTarget::SPIRV && facts.RootConstants.size() > 1) {
+    diagnostics.push_back(
+        {2103, "SPIR-V source contains multiple push constant blocks"});
+    return false;
   }
-  AppendU32(bytes, static_cast<uint32_t>(request.Assignments.size()));
-  for (const NameValue &assignment : request.Assignments) {
-    AppendString(bytes, assignment.Name);
-    AppendString(bytes, assignment.Value);
+  if (target == RadRayDxcTarget::SPIRV && facts.HasStaticSamplerPolicy) {
+    for (MetadataBindingFact &binding : facts.Bindings) {
+      if (binding.Type !=
+          static_cast<uint32_t>(MetadataBindingKind::Sampler))
+        continue;
+      if (facts.StaticSamplerNames.empty() ||
+          std::find(facts.StaticSamplerNames.begin(),
+                    facts.StaticSamplerNames.end(),
+                    binding.Name) != facts.StaticSamplerNames.end())
+        binding.Flags |= kMetadataImmutableSampler;
+    }
   }
-  bytes.insert(bytes.end(), kToolchainIdentity,
-               kToolchainIdentity + sizeof(kToolchainIdentity));
-  return bytes;
+  if (target == RadRayDxcTarget::DXIL && facts.HasRootSignature) {
+    const auto hasRootBinding = [](const MetadataRootBindingFact &rootBinding,
+                                   const MetadataBindingFact &binding) noexcept {
+      return rootBinding.RegisterClass == binding.RegisterClass &&
+             rootBinding.Group == binding.Group &&
+             rootBinding.Binding == binding.Binding;
+    };
+    const bool hasNonSamplerRootBinding = std::any_of(
+        facts.RootBindings.begin(), facts.RootBindings.end(),
+        [](const MetadataRootBindingFact &rootBinding) noexcept {
+          return rootBinding.RegisterClass != 3u;
+        });
+    if (hasNonSamplerRootBinding) {
+      for (const MetadataBindingFact &binding : facts.Bindings) {
+        if (!binding.HasExplicitBinding &&
+            binding.Type != static_cast<uint32_t>(MetadataBindingKind::Sampler))
+          continue;
+        const auto found = std::find_if(
+            facts.RootBindings.begin(), facts.RootBindings.end(),
+            [&](const MetadataRootBindingFact &rootBinding) noexcept {
+              return hasRootBinding(rootBinding, binding);
+            });
+        if (found == facts.RootBindings.end()) {
+          diagnostics.push_back(
+              {2106, "DXIL RootSignature does not contain an active resource"});
+          return false;
+        }
+      }
+    }
+    for (MetadataBindingFact &binding : facts.Bindings)
+      if (binding.Type == static_cast<uint32_t>(MetadataBindingKind::Sampler) &&
+          std::any_of(facts.RootBindings.begin(), facts.RootBindings.end(),
+                      [&](const MetadataRootBindingFact &rootBinding) noexcept {
+                        return hasRootBinding(rootBinding, binding);
+                      }))
+        binding.Flags |= kMetadataImmutableSampler;
+    for (const MetadataRootBindingFact &rootBinding : facts.RootBindings) {
+      const auto found = std::find_if(
+          facts.Bindings.begin(), facts.Bindings.end(),
+          [&](const MetadataBindingFact &binding) noexcept {
+            return hasRootBinding(rootBinding, binding);
+          });
+      if (found == facts.Bindings.end()) {
+        diagnostics.push_back(
+            {2106, "DXIL RootSignature contains an inactive resource"});
+        return false;
+      }
+    }
+  }
+  for (MetadataRootConstantFact &constant : facts.RootConstants)
+    constant.StageMask &= 0x7u;
+  if (target == RadRayDxcTarget::DXIL && facts.HasRootSignature) {
+    uint32_t allStageMask = 0;
+    for (const EntryPoint &entry : contract.EntryPoints)
+      allStageMask |= MetadataStageBitFor(entry.Stage);
+    for (MetadataRootConstantFact &constant : facts.RootConstants)
+      constant.StageMask = allStageMask;
+  }
+  return true;
 }
 
 bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
                    RadRayDxcTarget target, const vector<StageOutput> &stages,
-                   const Hash128 &compileInput, vector<Diagnostic> &diagnostics,
-                   vector<uint8_t> &metadata) {
+                   vector<Diagnostic> &diagnostics, vector<uint8_t> &metadata) {
   MetadataFacts facts;
-  const string rootSource(reinterpret_cast<const char *>(request.RootSource.data()),
-                          request.RootSource.size());
-  if (!BuildMetadataFacts(rootSource, contract, target, facts, diagnostics))
+  if (!MergeMetadataFacts(contract, target, stages, facts, diagnostics))
     return false;
 
   const uint32_t entryOffset = sizeof(WireEnvelope);
@@ -2115,7 +2524,6 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
   envelope.Bytecode = {bytecodeOffset, bytecodeSize};
   envelope.ToolchainIdentity = kMetadataToolchainIdentity;
   std::memcpy(envelope.Contract, contract.Hash.Bytes, sizeof(envelope.Contract));
-  std::memcpy(envelope.CompileInput, compileInput.Bytes, sizeof(envelope.CompileInput));
 
   vector<WireEntryRecord> entries;
   entries.reserve(contract.EntryPoints.size());
@@ -2458,7 +2866,9 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE DiscoverSourceContract(
-      RadRayDxcBlobView request, IRadRayDxcResult **result) override {
+      RadRayDxcBlobView request,
+      RadRayDxcIncludePathListView includePaths,
+      IRadRayDxcResult **result) override {
     if (result == nullptr)
       return E_POINTER;
     *result = nullptr;
@@ -2469,19 +2879,53 @@ public:
     if (output.p == nullptr)
       return E_OUTOFMEMORY;
     output->SetAbi();
-    string sourceName;
-    vector<uint8_t> source;
-    RadRayDxcTarget target{};
+    DiscoveryRequest parsed;
     string error;
     ContractData contract;
     vector<Diagnostic> diagnostics;
-    if (!ReadDiscoveryRequest(request, sourceName, source, target, error) ||
-        !DiscoverContract(sourceName, source, contract, diagnostics)) {
+    if (!ReadDiscoveryRequest(request, parsed, error)) {
       output->SetStatus(RadRayDxcCompileStatus::InvalidRequest);
       if (!error.empty())
         output->AddDiagnostic(2000, std::move(error));
       for (Diagnostic &diagnostic : diagnostics)
         output->AddDiagnostic(diagnostic.Code, std::move(diagnostic.Message));
+      return PublishResult(output, result);
+    }
+    bool hasContract = false;
+    if ((parsed.Targets & 1u) != 0) {
+      if (!CollectContractWithFrontend(parsed, RadRayDxcTarget::DXIL,
+                                       includePaths, contract, diagnostics)) {
+        output->SetStatus(RadRayDxcCompileStatus::InvalidRequest);
+        for (Diagnostic &diagnostic : diagnostics)
+          output->AddDiagnostic(diagnostic.Code, std::move(diagnostic.Message));
+        return PublishResult(output, result);
+      }
+      hasContract = true;
+    }
+    if ((parsed.Targets & 2u) != 0) {
+      ContractData spirvContract;
+      if (!CollectContractWithFrontend(parsed, RadRayDxcTarget::SPIRV,
+                                       includePaths, spirvContract,
+                                       diagnostics)) {
+        output->SetStatus(RadRayDxcCompileStatus::InvalidRequest);
+        for (Diagnostic &diagnostic : diagnostics)
+          output->AddDiagnostic(diagnostic.Code, std::move(diagnostic.Message));
+        return PublishResult(output, result);
+      }
+      if (hasContract && EncodeContract(contract) != EncodeContract(spirvContract)) {
+        output->SetStatus(RadRayDxcCompileStatus::InvalidRequest);
+        output->AddDiagnostic(
+            2011, "DXIL and SPIR-V frontends discovered different source contracts");
+        return PublishResult(output, result);
+      }
+      if (!hasContract) {
+        contract = std::move(spirvContract);
+        hasContract = true;
+      }
+    }
+    if (!hasContract) {
+      output->SetStatus(RadRayDxcCompileStatus::InvalidRequest);
+      output->AddDiagnostic(2000, "discovery request did not select a target");
       return PublishResult(output, result);
     }
     output->SetStatus(RadRayDxcCompileStatus::Success);
@@ -2490,7 +2934,9 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE CompileVariant(
-      RadRayDxcBlobView request, IRadRayDxcResult **result) override {
+      RadRayDxcBlobView request,
+      RadRayDxcIncludePathListView includePaths,
+      IRadRayDxcResult **result) override {
     if (result == nullptr)
       return E_POINTER;
     *result = nullptr;
@@ -2508,13 +2954,51 @@ public:
       output->AddDiagnostic(2000, std::move(error));
       return PublishResult(output, result);
     }
+    vector<wstring> validatedPathStorage;
+    if (!AppendIncludePathArguments(includePaths, validatedPathStorage, error)) {
+      output->SetStatus(RadRayDxcCompileStatus::InvalidRequest);
+      output->AddDiagnostic(2000, std::move(error));
+      return PublishResult(output, result);
+    }
     ContractData contract;
     vector<Diagnostic> discoveryDiagnostics;
-    if (!DiscoverContract(parsed.SourceName, parsed.RootSource, contract,
-                          discoveryDiagnostics)) {
+    const DiscoveryRequest discoveryRequest = MakeDiscoveryRequest(parsed);
+    bool hasContract = false;
+    if ((parsed.Targets & 1u) != 0) {
+      if (!CollectContractWithFrontend(discoveryRequest,
+                                       RadRayDxcTarget::DXIL, includePaths,
+                                       contract, discoveryDiagnostics)) {
+        output->SetStatus(RadRayDxcCompileStatus::InvalidRequest);
+        for (Diagnostic &diagnostic : discoveryDiagnostics)
+          output->AddDiagnostic(diagnostic.Code, std::move(diagnostic.Message));
+        return PublishResult(output, result);
+      }
+      hasContract = true;
+    }
+    if ((parsed.Targets & 2u) != 0) {
+      ContractData otherContract;
+      if (!CollectContractWithFrontend(
+              discoveryRequest, RadRayDxcTarget::SPIRV, includePaths,
+              otherContract, discoveryDiagnostics)) {
+        output->SetStatus(RadRayDxcCompileStatus::InvalidRequest);
+        for (Diagnostic &diagnostic : discoveryDiagnostics)
+          output->AddDiagnostic(diagnostic.Code, std::move(diagnostic.Message));
+        return PublishResult(output, result);
+      }
+      if (hasContract && EncodeContract(contract) != EncodeContract(otherContract)) {
+        output->SetStatus(RadRayDxcCompileStatus::InvalidRequest);
+        output->AddDiagnostic(
+            2011, "DXIL and SPIR-V frontends discovered different source contracts");
+        return PublishResult(output, result);
+      }
+      if (!hasContract) {
+        contract = std::move(otherContract);
+        hasContract = true;
+      }
+    }
+    if (!hasContract) {
       output->SetStatus(RadRayDxcCompileStatus::InvalidRequest);
-      for (Diagnostic &diagnostic : discoveryDiagnostics)
-        output->AddDiagnostic(diagnostic.Code, std::move(diagnostic.Message));
+      output->AddDiagnostic(2000, "compile request did not select a target");
       return PublishResult(output, result);
     }
     output->SetContract(EncodeContract(contract));
@@ -2530,24 +3014,44 @@ public:
       return PublishResult(output, result);
     }
 
+    DiscoveryRequest concreteRequest = MakeDiscoveryRequest(parsed);
+    concreteRequest.Defines.reserve(
+        concreteRequest.Defines.size() + parsed.Assignments.size());
+    for (const NameValue &assignment : parsed.Assignments)
+      concreteRequest.Defines.push_back(assignment);
+    for (const RadRayDxcTarget target : {RadRayDxcTarget::DXIL,
+                                         RadRayDxcTarget::SPIRV}) {
+      const uint8_t bit = target == RadRayDxcTarget::DXIL ? 1 : 2;
+      if ((parsed.Targets & bit) == 0)
+        continue;
+      ContractData concreteContract;
+      vector<Diagnostic> concreteDiagnostics;
+      if (!CollectContractWithFrontend(concreteRequest, target, includePaths,
+                                       concreteContract, concreteDiagnostics)) {
+        output->SetStatus(RadRayDxcCompileStatus::InvalidRequest);
+        for (Diagnostic &diagnostic : concreteDiagnostics)
+          output->AddDiagnostic(diagnostic.Code, std::move(diagnostic.Message));
+        return PublishResult(output, result);
+      }
+      if (EncodeContract(concreteContract) != EncodeContract(contract)) {
+        output->SetStatus(RadRayDxcCompileStatus::InvalidRequest);
+        output->AddDiagnostic(
+            2007, "concrete assignments changed the frontend source contract");
+        return PublishResult(output, result);
+      }
+    }
+
     for (const RadRayDxcTarget target : {RadRayDxcTarget::DXIL, RadRayDxcTarget::SPIRV}) {
       const uint8_t bit = target == RadRayDxcTarget::DXIL ? 1 : 2;
       if ((parsed.Targets & bit) == 0)
         continue;
-      string expanded;
-      vector<IncludeSource> opened;
-      if (!ExpandSource(parsed, target, expanded, opened)) {
-        output->SetStatus(RadRayDxcCompileStatus::TargetFailure);
-        output->ClearLanes();
-        output->AddDiagnostic(2009, "typed include expansion failed");
-        return PublishResult(output, result);
-      }
-      vector<StageOutput> stages;
       vector<Diagnostic> compileDiagnostics;
+      vector<StageOutput> stages;
       bool success = true;
       for (const EntryPoint &entry : contract.EntryPoints) {
         StageOutput stage;
-        if (!CompileStage(parsed, target, entry, expanded, stage, compileDiagnostics)) {
+        if (!CompileStage(parsed, target, entry, includePaths, stage,
+                          compileDiagnostics)) {
           success = false;
           break;
         }
@@ -2560,14 +3064,11 @@ public:
           output->AddDiagnostic(diagnostic.Code, std::move(diagnostic.Message));
         return PublishResult(output, result);
       }
-      const vector<uint8_t> inputBytes = EncodeCompileInput(parsed, target, opened);
-      const Hash128 inputHash = Digest(inputBytes, 0x434f4d50494c45ull + bit);
       vector<uint8_t> bytecode;
       for (const StageOutput &stage : stages)
         AppendBytes(bytecode, stage.Bytecode);
       vector<uint8_t> metadata;
-      if (!BuildMetadata(parsed, contract, target, stages, inputHash,
-                         compileDiagnostics, metadata)) {
+      if (!BuildMetadata(parsed, contract, target, stages, compileDiagnostics, metadata)) {
         output->SetStatus(RadRayDxcCompileStatus::TargetFailure);
         output->ClearLanes();
         for (Diagnostic &diagnostic : compileDiagnostics)

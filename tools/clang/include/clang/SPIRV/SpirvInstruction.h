@@ -641,6 +641,8 @@ public:
   bool hasInitializer() const { return initializer != nullptr; }
   SpirvInstruction *getInitializer() const { return initializer; }
   bool hasBinding() const { return descriptorSet >= 0 || binding >= 0; }
+  int32_t getDescriptorSetNo() const { return descriptorSet; }
+  int32_t getBindingNo() const { return binding; }
   llvm::StringRef getHlslUserType() const { return hlslUserType; }
 
   void setDescriptorSetNo(int32_t dset) { descriptorSet = dset; }
