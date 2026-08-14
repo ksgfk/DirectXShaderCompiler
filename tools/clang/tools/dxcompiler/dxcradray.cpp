@@ -18,6 +18,7 @@
 #undef interface
 #endif
 
+#include "clang/AST/Attr.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/HlslTypes.h"
 #include "clang/Frontend/CompilerInstance.h"
@@ -44,7 +45,9 @@
 #include "clang/SPIRV/SpirvInstruction.h"
 #include "clang/SPIRV/SpirvModule.h"
 #include "clang/SPIRV/SpirvType.h"
+#include "DeclResultIdMapper.h"
 #include "SpirvEmitter.h"
+#include "StageVar.h"
 #endif
 
 #include <algorithm>
@@ -78,12 +81,13 @@ using radray::shader::RadRayDxcIncludePathListView;
 using radray::shader::RadRayDxcLaneView;
 using radray::shader::RadRayDxcTarget;
 
+// Toolchain identity gates artifact trust on the RadRay side. Bump both values
+// together whenever compiler output semantics change, then regenerate goldens.
 constexpr uint8_t kToolchainIdentity[16] = {
-    0x08, 0x02, 0x09, 0x01, 0x72, 0x61, 0x64, 0x72,
-    0x61, 0x79, 0x2d, 0x31, 0x2e, 0x39, 0x2e, 0x33};
-constexpr uint64_t kMetadataToolchainIdentity = 0x0000000001090209ull;
+    0x10, 0x02, 0x09, 0x01, 0x72, 0x61, 0x64, 0x72,
+    0x61, 0x79, 0x2d, 0x31, 0x2e, 0x39, 0x2e, 0x34};
+constexpr uint64_t kMetadataToolchainIdentity = 0x0000000001090210ull;
 constexpr uint32_t kMaxCollectionCount = 4096;
-constexpr uint32_t kMaxEntryCount = 16;
 
 struct Hash128 {
   uint8_t Bytes[16]{};
@@ -298,6 +302,41 @@ bool HasDuplicateNames(const vector<NameValue> &values) noexcept {
   return false;
 }
 
+// Reject policy fields the compiler does not honor instead of silently
+// ignoring them; every accepted value must change compiler behavior.
+bool ValidateCompilePolicy(uint32_t shaderModel, uint8_t optimize,
+                           uint8_t debugInfo, uint8_t allResourcesBound,
+                           uint8_t warningPolicy, uint32_t spirvTargetEnv,
+                           uint32_t hlslVersion, uint32_t reserved,
+                           string &error) {
+  if (shaderModel < 60 || shaderModel > 69) {
+    error = "compile policy requests an unsupported shader model";
+    return false;
+  }
+  if (optimize > 1 || debugInfo > 1 || allResourcesBound > 1) {
+    error = "compile policy boolean field is out of range";
+    return false;
+  }
+  if (warningPolicy > 1) {
+    error = "compile policy warning policy is out of range";
+    return false;
+  }
+  if (spirvTargetEnv != 0) {
+    error = "compile policy requests an unsupported SPIR-V target environment";
+    return false;
+  }
+  if (hlslVersion != 2016 && hlslVersion != 2017 && hlslVersion != 2018 &&
+      hlslVersion != 2021) {
+    error = "compile policy requests an unsupported HLSL version";
+    return false;
+  }
+  if (reserved != 0) {
+    error = "compile policy reserved field must be zero";
+    return false;
+  }
+  return true;
+}
+
 bool ReadCompileRequest(RadRayDxcBlobView view, CompileRequest &request,
                         string &error) {
   WireReader reader{view};
@@ -331,6 +370,12 @@ bool ReadCompileRequest(RadRayDxcBlobView view, CompileRequest &request,
     error = "compile request contains duplicate define or assignment names";
     return false;
   }
+  if (!ValidateCompilePolicy(request.ShaderModel, request.Optimize,
+                             request.DebugInfo, request.AllResourcesBound,
+                             request.WarningPolicy, request.SpirvTargetEnv,
+                             request.HlslVersion, request.Reserved, error)) {
+    return false;
+  }
   return true;
 }
 
@@ -359,6 +404,12 @@ bool ReadDiscoveryRequest(RadRayDxcBlobView view, DiscoveryRequest &request,
   }
   if (HasDuplicateNames(request.Defines)) {
     error = "discovery request contains duplicate define names";
+    return false;
+  }
+  if (!ValidateCompilePolicy(request.ShaderModel, request.Optimize,
+                             request.DebugInfo, request.AllResourcesBound,
+                             request.WarningPolicy, request.SpirvTargetEnv,
+                             request.HlslVersion, request.Reserved, error)) {
     return false;
   }
   return true;
@@ -424,7 +475,13 @@ struct MetadataBindingFact {
   uint32_t Count{1};
   uint32_t StageMask{0};
   uint32_t Flags{0};
-  bool HasExplicitBinding{false};
+  // Authored DXIL register, carried on SPIR-V bindings only. The immutable
+  // sampler policy lives in the DXIL RootSignature, so associating it with a
+  // SPIR-V binding needs a key both lanes share; the Vulkan set/binding pair
+  // is not one. Absent on the DXIL lane, which matches on register directly.
+  bool HasDxilRegister{false};
+  uint32_t DxilRegisterSpace{0};
+  uint32_t DxilRegisterNumber{0};
 };
 
 struct MetadataTypeFact {
@@ -471,11 +528,15 @@ struct MetadataFacts {
   vector<MetadataVertexInputFact> VertexInputs;
   vector<MetadataRootBindingFact> RootBindings;
   vector<MetadataRootBindingFact> StaticSamplerBindings;
-  vector<string> StaticSamplerNames;
   vector<uint8_t> SerializedRootSignature;
   Hash128 RootSignatureHash{};
+  // Auxiliary DXIL policy identity carried by SPIR-V stage facts. It is used
+  // only to reject conflicting graphics-stage RootSignatures and is never
+  // serialized into the SPIR-V lane.
+  Hash128 DxilRootPolicyHash{};
   bool HasRootSignature{false};
   bool HasStaticSamplerPolicy{false};
+  bool HasDxilRootPolicy{false};
 };
 
 struct Diagnostic {
@@ -524,6 +585,8 @@ public:
       : _collector(collector) {}
 
   bool VisitFunctionDecl(clang::FunctionDecl *decl);
+  bool VisitVarDecl(clang::VarDecl *decl);
+  bool VisitHLSLBufferDecl(clang::HLSLBufferDecl *decl);
 
 private:
   RadRayContractCollector &_collector;
@@ -632,9 +695,7 @@ public:
   void AddKeywordGroup(KeywordGroup group, clang::SourceLocation location,
                        bool isMainFile, uint32_t conditionDepth);
   void AddEntry(clang::FunctionDecl &decl, string stage);
-  void AddVertexInput(string semantic, uint32_t semanticIndex,
-                      uint32_t componentType, uint32_t componentCount,
-                      uint32_t location);
+  void RecordDxilResourceBinding(const clang::NamedDecl &decl);
   void EnterCondition(clang::SourceLocation location) {
     _conditionStarts.push_back(location);
     ++_conditionDepth;
@@ -670,6 +731,7 @@ public:
 #ifdef ENABLE_SPIRV_CODEGEN
   void CollectSpirvAction(clang::EmitSpirvAction &action,
                           string_view entryPointName);
+  void CollectSpirvVertexInputs(clang::spirv::SpirvEmitter &emitter);
 #endif
 
 private:
@@ -688,6 +750,7 @@ private:
   RadRayDxcTarget _target{RadRayDxcTarget::DXIL};
   ShaderStage _stage{ShaderStage::Vertex};
   MetadataFacts _metadata;
+  vector<string> _dxilImplicitResourceNames;
 #ifdef ENABLE_SPIRV_CODEGEN
   bool _sawPushConstant{false};
 #endif
@@ -761,6 +824,22 @@ void RadRayKeywordPragmaHandler::HandlePragma(
                              conditionDepth);
 }
 
+bool RadRayContractAstVisitor::VisitVarDecl(clang::VarDecl *decl) {
+  clang::QualType type = decl->getType();
+  while (const clang::ArrayType *array =
+             decl->getASTContext().getAsArrayType(type))
+    type = array->getElementType();
+  if (decl->isFileVarDecl() && hlsl::IsHLSLResourceType(type))
+    _collector.RecordDxilResourceBinding(*decl);
+  return true;
+}
+
+bool RadRayContractAstVisitor::VisitHLSLBufferDecl(
+    clang::HLSLBufferDecl *decl) {
+  _collector.RecordDxilResourceBinding(*decl);
+  return true;
+}
+
 bool RadRayContractAstVisitor::VisitFunctionDecl(clang::FunctionDecl *decl) {
   const clang::HLSLShaderAttr *attribute =
       decl->getAttr<clang::HLSLShaderAttr>();
@@ -772,51 +851,6 @@ bool RadRayContractAstVisitor::VisitFunctionDecl(clang::FunctionDecl *decl) {
     return true;
   _seen.push_back(canonical);
   _collector.AddEntry(*decl, attribute->getStage().str());
-  if (attribute->getStage() == "vertex") {
-    uint32_t location = 0;
-    for (const clang::ParmVarDecl *parameter : decl->parameters()) {
-      string semantic;
-      uint32_t semanticIndex = 0;
-      for (const hlsl::UnusualAnnotation *annotation :
-           parameter->getUnusualAnnotations()) {
-        const auto *semanticDecl = llvm::dyn_cast<hlsl::SemanticDecl>(annotation);
-        if (semanticDecl == nullptr)
-          continue;
-        semantic = semanticDecl->SemanticName.str();
-        size_t suffix = semantic.size();
-        while (suffix != 0 &&
-               std::isdigit(static_cast<unsigned char>(semantic[suffix - 1])) != 0)
-          --suffix;
-        for (size_t index = suffix; index < semantic.size(); ++index)
-          semanticIndex = semanticIndex * 10u +
-                          static_cast<uint32_t>(semantic[index] - '0');
-        semantic.resize(suffix);
-        break;
-      }
-      if (semantic.empty() ||
-          (semantic.size() >= 3 && semantic.compare(0, 3, "SV_") == 0))
-        continue;
-
-      clang::QualType elementType = hlsl::GetElementTypeOrType(parameter->getType());
-      if (hlsl::IsHLSLVecType(parameter->getType()))
-        elementType = hlsl::GetHLSLVecElementType(parameter->getType());
-      uint32_t componentType = 0;
-      if (const auto *builtin = elementType->getAs<clang::BuiltinType>()) {
-        if (builtin->isFloatingPoint())
-          componentType = 1;
-        else if (builtin->isSignedInteger())
-          componentType = 2;
-        else if (builtin->isUnsignedInteger())
-          componentType = 3;
-      }
-      const uint32_t componentCount = hlsl::IsHLSLVecType(parameter->getType())
-                                          ? hlsl::GetHLSLVecSize(parameter->getType())
-                                          : 1u;
-      if (componentType != 0 && componentCount != 0)
-        _collector.AddVertexInput(std::move(semantic), semanticIndex,
-                                  componentType, componentCount, location++);
-    }
-  }
   return true;
 }
 
@@ -987,21 +1021,23 @@ void RadRayContractCollector::AddEntry(clang::FunctionDecl &decl,
   _entryPoints.push_back({decl.getName().str(), stage});
 }
 
-void RadRayContractCollector::AddVertexInput(string semantic,
-                                              uint32_t semanticIndex,
-                                              uint32_t componentType,
-                                              uint32_t componentCount,
-                                              uint32_t location) {
-  const auto duplicate = std::find_if(
-      _metadata.VertexInputs.begin(), _metadata.VertexInputs.end(),
-      [&](const MetadataVertexInputFact &value) noexcept {
-        return value.Semantic == semantic && value.SemanticIndex == semanticIndex;
-      });
-  if (duplicate == _metadata.VertexInputs.end()) {
-    _metadata.VertexInputs.push_back({std::move(semantic), semanticIndex,
-                                      location, componentType, componentCount,
-                                      0});
+void RadRayContractCollector::RecordDxilResourceBinding(
+    const clang::NamedDecl &decl) {
+  if (_target != RadRayDxcTarget::DXIL)
+    return;
+  for (const hlsl::UnusualAnnotation *annotation :
+       decl.getUnusualAnnotations()) {
+    const auto *assignment =
+        llvm::dyn_cast<hlsl::RegisterAssignment>(annotation);
+    if (assignment != nullptr && assignment->RegisterType != 0)
+      return;
   }
+  const string name = decl.getNameAsString();
+  if (!name.empty() &&
+      std::find(_dxilImplicitResourceNames.begin(),
+                _dxilImplicitResourceNames.end(), name) ==
+          _dxilImplicitResourceNames.end())
+    _dxilImplicitResourceNames.push_back(name);
 }
 
 bool RadRayContractCollector::Finalize(
@@ -1098,9 +1134,9 @@ MetadataBindingFact *AddMetadataBinding(MetadataFacts &facts, string name,
     return &*found;
   }
   facts.Bindings.push_back({std::move(name), group, binding,
-                            MetadataRegisterNamespace(kind),
-                            static_cast<uint32_t>(kind), std::max(1u, count),
-                            MetadataStageBitFor(stage), flags, true});
+                             MetadataRegisterNamespace(kind),
+                             static_cast<uint32_t>(kind), std::max(1u, count),
+                             MetadataStageBitFor(stage), flags});
   return &facts.Bindings.back();
 }
 
@@ -1355,9 +1391,7 @@ void AddDxilResourceFact(const hlsl::DxilResourceBase &resource,
   if (registerClass == 0xffffffffu)
     return;
   const MetadataBindingKind kind = DxilBindingKind(resource);
-  const bool hasExplicitBinding = resource.GetLowerBound() != UINT_MAX;
-  const uint32_t binding = hasExplicitBinding ? resource.GetLowerBound()
-                                               : resource.GetID();
+  const uint32_t binding = resource.GetLowerBound();
   const uint32_t group = resource.GetSpaceID() == UINT_MAX
                              ? 0u
                              : resource.GetSpaceID();
@@ -1366,7 +1400,6 @@ void AddDxilResourceFact(const hlsl::DxilResourceBase &resource,
       resource.GetRangeSize(), stage);
   if (fact != nullptr) {
     fact->RegisterClass = registerClass;
-    fact->HasExplicitBinding = hasExplicitBinding;
   }
 }
 
@@ -1390,6 +1423,25 @@ uint32_t DxilRootRangeClass(hlsl::DxilDescriptorRangeType type) noexcept {
     return 3;
   default:
     return 0xffffffffu;
+  }
+}
+
+// Maps the author-declared root parameter visibility to wire stage bits.
+// Compute contracts always collapse to the compute stage bit.
+uint32_t RootVisibilityStageMask(hlsl::DxilShaderVisibility visibility,
+                                 ShaderStage stage) noexcept {
+  if (stage == ShaderStage::Compute)
+    return MetadataStageBitFor(ShaderStage::Compute);
+  switch (visibility) {
+  case hlsl::DxilShaderVisibility::Vertex:
+    return MetadataStageBitFor(ShaderStage::Vertex);
+  case hlsl::DxilShaderVisibility::Pixel:
+    return MetadataStageBitFor(ShaderStage::Pixel);
+  case hlsl::DxilShaderVisibility::All:
+    return MetadataStageBitFor(ShaderStage::Vertex) |
+           MetadataStageBitFor(ShaderStage::Pixel);
+  default:
+    return MetadataStageBitFor(stage);
   }
 }
 
@@ -1434,7 +1486,7 @@ void ValidateDxilRootSignature(const hlsl::DxilVersionedRootSignatureDesc &root,
         facts.RootConstants.push_back(
             {parameter.Constants.RegisterSpace, parameter.Constants.ShaderRegister,
              0u, parameter.Constants.Num32BitValues * 4u,
-             MetadataStageBitFor(stage), 0u});
+             RootVisibilityStageMask(parameter.ShaderVisibility, stage), 0u});
       } else {
         const uint32_t registerClass =
             parameter.ParameterType == hlsl::DxilRootParameterType::CBV
@@ -1468,7 +1520,7 @@ void ValidateDxilRootSignature(const hlsl::DxilVersionedRootSignatureDesc &root,
         facts.RootConstants.push_back(
             {parameter.Constants.RegisterSpace, parameter.Constants.ShaderRegister,
              0u, parameter.Constants.Num32BitValues * 4u,
-             MetadataStageBitFor(stage), 0u});
+             RootVisibilityStageMask(parameter.ShaderVisibility, stage), 0u});
       } else {
         const uint32_t registerClass =
             parameter.ParameterType == hlsl::DxilRootParameterType::CBV
@@ -1490,22 +1542,6 @@ void ValidateDxilRootSignature(const hlsl::DxilVersionedRootSignatureDesc &root,
     }
   }
 
-  for (const MetadataBindingFact &binding : facts.Bindings) {
-    if (binding.RegisterClass != 3u)
-      continue;
-    const bool isStaticSampler = std::any_of(
-        staticSamplerBindings.begin(), staticSamplerBindings.end(),
-        [&](const MetadataRootBindingFact &rootBinding) noexcept {
-          return rootBinding.Group == binding.Group &&
-                 rootBinding.Binding == binding.Binding;
-        });
-    if (!isStaticSampler ||
-        std::find(facts.StaticSamplerNames.begin(),
-                  facts.StaticSamplerNames.end(),
-                  binding.Name) != facts.StaticSamplerNames.end())
-      continue;
-    facts.StaticSamplerNames.push_back(binding.Name);
-  }
   facts.HasStaticSamplerPolicy = !staticSamplerBindings.empty();
 
   for (const MetadataRootBindingFact &staticSampler : staticSamplerBindings) {
@@ -1550,7 +1586,32 @@ void ValidateDxilRootSignature(const hlsl::DxilVersionedRootSignatureDesc &root,
 void RadRayContractCollector::CollectDxilModule(llvm::Module &module) {
   hlsl::DxilModule &dxil = module.GetOrCreateDxilModule();
   dxil.RemoveUnusedResources();
+  // DXC has already assigned a lower bound to every surviving resource. Use the
+  // AST-side record to distinguish an authored register() from that automatic
+  // assignment, but only after dead-resource removal so unused declarations do
+  // not become contract failures.
+  const auto requireExplicitBinding =
+      [&](const hlsl::DxilResourceBase &resource) -> bool {
+    const string name = resource.GetGlobalName();
+    const bool implicit =
+        name == "$Globals" ||
+        std::find(_dxilImplicitResourceNames.begin(),
+                  _dxilImplicitResourceNames.end(), name) !=
+            _dxilImplicitResourceNames.end();
+    if (!implicit)
+      if (resource.GetLowerBound() != UINT_MAX)
+        return true;
+    if (implicit)
+      AddDiagnostic(2111, "DXIL resource '" + name +
+                              "' is missing an explicit register() binding");
+    else
+      AddDiagnostic(2116, "DXIL live resource '" + name +
+                              "' has no assigned register");
+    return false;
+  };
   for (const auto &resource : dxil.GetCBuffers()) {
+    if (!requireExplicitBinding(*resource))
+      continue;
     AddDxilResourceFact(*resource, _metadata, _stage);
     const llvm::Type *resourceType = resource->GetHLSLType();
     if (resourceType != nullptr && resourceType->isPointerTy())
@@ -1564,11 +1625,14 @@ void RadRayContractCollector::CollectDxilModule(llvm::Module &module) {
       CollectDxilTypeFacts(dxil.GetTypeSystem(), type, _metadata);
   }
   for (const auto &resource : dxil.GetSamplers())
-    AddDxilResourceFact(*resource, _metadata, _stage);
+    if (requireExplicitBinding(*resource))
+      AddDxilResourceFact(*resource, _metadata, _stage);
   for (const auto &resource : dxil.GetSRVs())
-    AddDxilResourceFact(*resource, _metadata, _stage);
+    if (requireExplicitBinding(*resource))
+      AddDxilResourceFact(*resource, _metadata, _stage);
   for (const auto &resource : dxil.GetUAVs())
-    AddDxilResourceFact(*resource, _metadata, _stage);
+    if (requireExplicitBinding(*resource))
+      AddDxilResourceFact(*resource, _metadata, _stage);
 
   if (_stage == ShaderStage::Vertex) {
     const hlsl::DxilSignature &input = dxil.GetInputSignature();
@@ -1593,9 +1657,12 @@ void RadRayContractCollector::CollectDxilModule(llvm::Module &module) {
         componentType = 3;
       if (componentType == 0)
         continue;
-      _metadata.VertexInputs.push_back(
-          {semantic, element->GetSemanticStartIndex(), location,
-           componentType, std::max(1u, element->GetRows() * element->GetCols()), 0});
+      const uint32_t rows = std::max(1u, element->GetRows());
+      const uint32_t columns = std::max(1u, element->GetCols());
+      for (uint32_t row = 0; row < rows; ++row)
+        _metadata.VertexInputs.push_back(
+            {semantic, element->GetSemanticStartIndex() + row, location + row,
+             componentType, columns, 0});
     }
   }
 
@@ -1619,7 +1686,10 @@ void RadRayContractCollector::CollectDxilModule(llvm::Module &module) {
 #ifdef ENABLE_SPIRV_CODEGEN
 const clang::spirv::SpirvType *UnwrapSpirvPointer(
     const clang::spirv::SpirvType *type) {
-  if (const auto *pointer = llvm::dyn_cast<clang::spirv::SpirvPointerType>(type))
+  // Instructions in a module that failed codegen may never have been lowered,
+  // so the SPIR-V type can legitimately be absent here.
+  if (const auto *pointer =
+          llvm::dyn_cast_or_null<clang::spirv::SpirvPointerType>(type))
     return pointer->getPointeeType();
   return type;
 }
@@ -1737,10 +1807,112 @@ void CollectSpirvStructFacts(const clang::spirv::StructType *structure,
   ResolveMetadataTypeIndices(facts.Types);
 }
 
+// The final stage-IO location is only decided during module finalization, so
+// the wire fact has to be read back from the emitted decorations rather than
+// recomputed from the AST declaration order.
+void RadRayContractCollector::CollectSpirvVertexInputs(
+    clang::spirv::SpirvEmitter &emitter) {
+  clang::spirv::SpirvModule *module = emitter.getSpirvBuilder().getModule();
+  if (module == nullptr)
+    return;
+
+  vector<std::pair<clang::spirv::SpirvInstruction *, uint32_t>> locations;
+  for (clang::spirv::SpirvDecoration *decoration :
+       module->getDecorationsForRadRay()) {
+    if (decoration == nullptr ||
+        decoration->getDecoration() != spv::Decoration::Location ||
+        decoration->getParams().empty())
+      continue;
+    locations.emplace_back(decoration->getTarget(),
+                           decoration->getParams().front());
+  }
+
+  _metadata.VertexInputs.clear();
+  for (const clang::spirv::StageVar &stageVar :
+       emitter.getDeclResultIdMapper().getStageVarsForRadRay()) {
+    if (stageVar.isSpirvBuitin() ||
+        stageVar.getStorageClass() != spv::StorageClass::Input)
+      continue;
+    const hlsl::SigPoint *sigPoint = stageVar.getSigPoint();
+    if (sigPoint == nullptr ||
+        sigPoint->GetKind() != hlsl::DXIL::SigPointKind::VSIn)
+      continue;
+    clang::spirv::SpirvVariable *instruction = stageVar.getSpirvInstr();
+    if (instruction == nullptr)
+      continue;
+    const clang::spirv::SemanticInfo &semanticInfo = stageVar.getSemanticInfo();
+    string semantic = semanticInfo.name.str();
+    if (semantic.empty() ||
+        (semantic.size() >= 3 && semantic.compare(0, 3, "SV_") == 0))
+      continue;
+
+    const auto location = std::find_if(
+        locations.begin(), locations.end(),
+        [&](const std::pair<clang::spirv::SpirvInstruction *, uint32_t> &value)
+            noexcept { return value.first == instruction; });
+    if (location == locations.end()) {
+      AddDiagnostic(2114, "SPIR-V vertex input '" + semantic +
+                              "' has no Location decoration");
+      continue;
+    }
+
+    const clang::spirv::SpirvType *valueType =
+        UnwrapSpirvPointer(instruction->getResultType());
+    uint32_t componentCount = 1;
+    uint32_t semanticRows = 1;
+    uint32_t locationStride = 1;
+    if (const auto *matrix =
+            llvm::dyn_cast_or_null<clang::spirv::MatrixType>(valueType)) {
+      unsigned int rowCount = 0;
+      unsigned int columnCount = 0;
+      hlsl::GetHLSLMatRowColCount(stageVar.getAstType(), rowCount,
+                                  columnCount);
+      if (rowCount == 0 || columnCount == 0) {
+        AddDiagnostic(2115, "SPIR-V vertex input '" + semantic +
+                                "' has invalid matrix dimensions");
+        continue;
+      }
+      semanticRows = rowCount;
+      componentCount = columnCount;
+      const uint32_t locationCount = stageVar.getLocationCount();
+      locationStride = std::max(1u, locationCount / semanticRows);
+      valueType = matrix->getElementType();
+    } else if (const auto *vector =
+                   llvm::dyn_cast_or_null<clang::spirv::VectorType>(valueType)) {
+      componentCount = vector->getElementCount();
+      valueType = vector->getElementType();
+    }
+    uint32_t componentType = 0;
+    if (llvm::dyn_cast_or_null<clang::spirv::FloatType>(valueType) != nullptr)
+      componentType = 1;
+    else if (const auto *integer =
+                 llvm::dyn_cast_or_null<clang::spirv::IntegerType>(valueType))
+      componentType = integer->isSignedInt() ? 2u : 3u;
+    if (componentType == 0) {
+      AddDiagnostic(2115, "SPIR-V vertex input '" + semantic +
+                              "' uses a type that cannot be described on the "
+                              "wire");
+      continue;
+    }
+
+    for (uint32_t row = 0; row < semanticRows; ++row)
+      _metadata.VertexInputs.push_back(
+          {semantic, semanticInfo.index + row,
+           location->second + row * locationStride, componentType,
+           componentCount, 0});
+  }
+}
+
 void RadRayContractCollector::CollectSpirvAction(
     clang::EmitSpirvAction &action, string_view entryPointName) {
   clang::spirv::SpirvEmitter *emitter = action.getSpirvEmitter();
   if (emitter == nullptr || emitter->getSpirvBuilder().getModule() == nullptr)
+    return;
+  // The observer hook fires even when SPIR-V codegen has already failed, and a
+  // half-built module has instructions whose types were never lowered. DXC's
+  // own error is authoritative here, so collecting from the wreckage would only
+  // trade a real diagnostic for a crash.
+  if (emitter->getDiagnosticsEngine().hasErrorOccurred())
     return;
   clang::spirv::SpirvModule *module = emitter->getSpirvBuilder().getModule();
 
@@ -1748,11 +1920,16 @@ void RadRayContractCollector::CollectSpirvAction(
   if (!entryPointName.empty()) {
     RadRaySpirvEntryPointFinder entryFinder(entryPointName);
     entryFinder.TraverseDecl(emitter->getASTContext().getTranslationUnitDecl());
-    if (entryFinder.EntryPoint() != nullptr) {
-      RadRaySpirvResourceUseVisitor resourceVisitor(
-          emitter->getDeclResultIdMapper(), activeResources);
-      resourceVisitor.TraverseEntry(entryFinder.EntryPoint());
+    // Without the entry point the reachability filter degrades to "every
+    // resource in the translation unit", which silently widens the contract.
+    if (entryFinder.EntryPoint() == nullptr) {
+      AddDiagnostic(2112, "SPIR-V entry point '" + string(entryPointName) +
+                              "' was not found in the compiled module");
+      return;
     }
+    RadRaySpirvResourceUseVisitor resourceVisitor(
+        emitter->getDeclResultIdMapper(), activeResources);
+    resourceVisitor.TraverseEntry(entryFinder.EntryPoint());
   }
   for (clang::spirv::SpirvVariableLike *variableLike : module->getVariables()) {
     auto *variable = llvm::dyn_cast<clang::spirv::SpirvVariable>(variableLike);
@@ -1816,19 +1993,54 @@ void RadRayContractCollector::CollectSpirvAction(
       isBinding = false;
     if (!isBinding)
       continue;
+    // DXC assigns a set/binding pair either way, so the authored attribute on
+    // the ResourceVar is the only place an implicit assignment is still
+    // distinguishable from a declared one. register() alone is not accepted: DXC
+    // would then derive the Vulkan slot from the DXIL register via the -fvk-*-shift
+    // policy, making the wire binding a function of toolchain defaults rather
+    // than of the source.
+    const auto &resourceVars =
+        emitter->getDeclResultIdMapper().getResourceVarsForRadRay();
+    const auto *resourceVar = std::find_if(
+        resourceVars.begin(), resourceVars.end(),
+        [&](const clang::spirv::ResourceVar &value) noexcept {
+          return value.getSpirvInstr() == variable;
+        });
+    if (resourceVar == resourceVars.end() ||
+        resourceVar->getBinding() == nullptr) {
+      AddDiagnostic(2113, "SPIR-V resource '" +
+                              variable->getDebugName().str() +
+                              "' is missing an explicit [[vk::binding]] binding");
+      continue;
+    }
     const int32_t group = variable->getDescriptorSetNo();
     const int32_t binding = variable->getBindingNo();
     if (group < 0 || binding < 0)
       continue;
-    AddMetadataBinding(_metadata, variable->getDebugName().str(),
-                       static_cast<uint32_t>(group),
-                       static_cast<uint32_t>(binding), bindingKind, count, _stage);
+    MetadataBindingFact *fact = AddMetadataBinding(
+        _metadata, variable->getDebugName().str(),
+        static_cast<uint32_t>(group), static_cast<uint32_t>(binding),
+        bindingKind, count, _stage);
+    // Keep the authored DXIL register so the merge step can associate the
+    // RootSignature's immutable sampler policy across stages.
+    const hlsl::RegisterAssignment *assignment = resourceVar->getRegister();
+    if (fact != nullptr && assignment != nullptr &&
+        assignment->RegisterType != 0) {
+      fact->HasDxilRegister = true;
+      fact->DxilRegisterNumber = assignment->RegisterNumber;
+      fact->DxilRegisterSpace = assignment->RegisterSpace.hasValue()
+                                    ? assignment->RegisterSpace.getValue()
+                                    : 0u;
+    }
     if (bindingKind == MetadataBindingKind::CBuffer) {
       const auto *structure =
           llvm::dyn_cast<clang::spirv::StructType>(valueType);
       CollectSpirvStructFacts(structure, _metadata);
     }
   }
+
+  if (_stage == ShaderStage::Vertex)
+    CollectSpirvVertexInputs(*emitter);
 }
 #endif
 
@@ -1884,16 +2096,34 @@ vector<uint8_t> EncodeContract(const ContractData &contract) {
   return bytes;
 }
 
-const wchar_t *ProfileForStage(ShaderStage stage) noexcept {
+// Discovery parses the whole translation unit with one library profile, so the
+// requested shader model has to reach it: language features gated on SM 6.2+
+// (for example ResourceDescriptorHeap) are otherwise rejected at discovery even
+// though the concrete stage compile would accept them. There is no lib_6_0, so
+// an SM 6.0 request maps to the lowest existing library profile.
+wstring LibraryProfileForShaderModel(uint32_t shaderModel) {
+  const uint32_t minor = std::max(1u, shaderModel - 60u);
+  wstring profile{L"lib_6_"};
+  profile.push_back(static_cast<wchar_t>(L'0' + minor));
+  return profile;
+}
+
+wstring ProfileForStage(ShaderStage stage, uint32_t shaderModel) {
+  const wchar_t *prefix = L"";
   switch (stage) {
   case ShaderStage::Vertex:
-    return L"vs_6_0";
+    prefix = L"vs_6_";
+    break;
   case ShaderStage::Pixel:
-    return L"ps_6_0";
+    prefix = L"ps_6_";
+    break;
   case ShaderStage::Compute:
-    return L"cs_6_0";
+    prefix = L"cs_6_";
+    break;
   }
-  return L"";
+  wstring profile{prefix};
+  profile.push_back(static_cast<wchar_t>(L'0' + (shaderModel - 60u)));
+  return profile;
 }
 
 bool ToWide(string_view value, wstring &result) {
@@ -1971,10 +2201,12 @@ bool CollectContractWithFrontend(
   }
   argumentStorage.push_back(std::move(hlslVersion));
   argumentStorage.emplace_back(L"-T");
-  argumentStorage.emplace_back(L"lib_6_1");
+  argumentStorage.push_back(LibraryProfileForShaderModel(request.ShaderModel));
   argumentStorage.emplace_back(L"-Vd");
   if (request.AllResourcesBound != 0)
     argumentStorage.emplace_back(L"-all_resources_bound");
+  if (request.WarningPolicy != 0)
+    argumentStorage.emplace_back(L"-WX");
   if (target == RadRayDxcTarget::SPIRV) {
     argumentStorage.emplace_back(L"-spirv");
     argumentStorage.emplace_back(L"-fspv-target-env=vulkan1.2");
@@ -2045,11 +2277,16 @@ struct StageOutput {
   MetadataFacts Facts;
 };
 
-bool TryCollectDxilRootPolicy(const CompileRequest &request,
-                              const EntryPoint &entry, IDxcUtils *utils,
-                              IDxcIncludeHandler *includeHandler,
-                              const vector<wstring> &spirvArguments,
-                              MetadataFacts &facts) {
+// Auxiliary DXIL analysis feeding the SPIR-V lane's immutable-sampler
+// association. Fails closed: any analysis error is a lane failure, while a
+// shader without an explicit RootSignature succeeds with
+// facts.HasRootSignature == false.
+bool CollectDxilRootPolicyForSpirv(const CompileRequest &request,
+                                   const EntryPoint &entry, IDxcUtils *utils,
+                                   IDxcIncludeHandler *includeHandler,
+                                   const vector<wstring> &spirvArguments,
+                                   MetadataFacts &facts,
+                                   vector<Diagnostic> &diagnostics) {
   vector<wstring> argumentStorage;
   argumentStorage.reserve(spirvArguments.size());
   for (const wstring &argument : spirvArguments) {
@@ -2066,14 +2303,21 @@ bool TryCollectDxilRootPolicy(const CompileRequest &request,
   wstring sourceName;
   wstring entryName;
   if (!ToWide(request.SourceName, sourceName) ||
-      !ToWide(entry.Name, entryName))
+      !ToWide(entry.Name, entryName)) {
+    diagnostics.push_back({2000, "source or entry name is not valid UTF-8"});
     return false;
+  }
+  const wstring probeProfile = ProfileForStage(entry.Stage, request.ShaderModel);
   CComPtr<IDxcCompilerArgs> compilerArgs;
   if (FAILED(utils->BuildArguments(
-          sourceName.c_str(), entryName.c_str(), ProfileForStage(entry.Stage),
+          sourceName.c_str(), entryName.c_str(), probeProfile.c_str(),
           arguments.data(), static_cast<uint32_t>(arguments.size()), nullptr, 0,
-          &compilerArgs)))
+          &compilerArgs))) {
+    diagnostics.push_back(
+        {2003,
+         "fork DXC argument construction failed for the DXIL root policy analysis"});
     return false;
+  }
 
   DxcBuffer source{};
   source.Ptr = request.RootSource.data();
@@ -2084,15 +2328,19 @@ bool TryCollectDxilRootPolicy(const CompileRequest &request,
   CComPtr<IDxcResult> result;
   if (FAILED(CompileDxcWithRadRayObserver(
           &source, compilerArgs->GetArguments(), compilerArgs->GetCount(),
-          includeHandler, &observer, IID_PPV_ARGS(&result))))
+          includeHandler, &observer, IID_PPV_ARGS(&result)))) {
+    diagnostics.push_back(
+        {2003, "fork DXC DXIL root policy analysis call failed"});
     return false;
-  vector<Diagnostic> ignoredDiagnostics;
-  if (!CheckDxcResult(result, 2004,
-                      "fork DXC rejected the DXIL root policy probe",
-                      ignoredDiagnostics))
+  }
+  if (!CheckDxcResult(result, 2110,
+                      "DXIL root policy analysis for the SPIR-V lane failed",
+                      diagnostics))
+    return false;
+  if (!observer.AppendDiagnostics(diagnostics))
     return false;
   facts = observer.Metadata();
-  return facts.HasRootSignature;
+  return true;
 }
 
 bool CompileStage(const CompileRequest &request, RadRayDxcTarget target,
@@ -2117,6 +2365,8 @@ bool CompileStage(const CompileRequest &request, RadRayDxcTarget target,
     argumentStorage.emplace_back(L"-Zi");
   if (request.AllResourcesBound != 0)
     argumentStorage.emplace_back(L"-all_resources_bound");
+  if (request.WarningPolicy != 0)
+    argumentStorage.emplace_back(L"-WX");
   if (target == RadRayDxcTarget::DXIL)
     argumentStorage.emplace_back(L"-Qstrip_rootsignature");
   if (target == RadRayDxcTarget::SPIRV) {
@@ -2157,9 +2407,10 @@ bool CompileStage(const CompileRequest &request, RadRayDxcTarget target,
     diagnostics.push_back({2000, "source or entry name is not valid UTF-8"});
     return false;
   }
+  const wstring stageProfile = ProfileForStage(entry.Stage, request.ShaderModel);
   CComPtr<IDxcCompilerArgs> compilerArgs;
   if (FAILED(utils->BuildArguments(
-          sourceName.c_str(), entryName.c_str(), ProfileForStage(entry.Stage),
+          sourceName.c_str(), entryName.c_str(), stageProfile.c_str(),
           arguments.data(), static_cast<uint32_t>(arguments.size()), nullptr, 0,
           &compilerArgs))) {
     diagnostics.push_back({2003, "fork DXC argument construction failed"});
@@ -2218,26 +2469,33 @@ bool CompileStage(const CompileRequest &request, RadRayDxcTarget target,
   }
   if (target == RadRayDxcTarget::SPIRV) {
     MetadataFacts dxilRootPolicy;
-    const bool hasRootPolicy =
-        TryCollectDxilRootPolicy(request, entry, utils.p, includeHandler.p,
-                                 argumentStorage, dxilRootPolicy);
-    if (hasRootPolicy &&
+    if (!CollectDxilRootPolicyForSpirv(request, entry, utils.p,
+                                       includeHandler.p, argumentStorage,
+                                       dxilRootPolicy, diagnostics))
+      return false;
+    if (dxilRootPolicy.HasRootSignature) {
+      output.Facts.HasDxilRootPolicy = true;
+      output.Facts.DxilRootPolicyHash = dxilRootPolicy.RootSignatureHash;
+    }
+    if (dxilRootPolicy.HasRootSignature &&
         dxilRootPolicy.HasStaticSamplerPolicy) {
+      // Carry the policy's register slots forward; the flag itself is applied
+      // in MergeMetadataFacts, where every stage's probe has been unioned. The
+      // stage declaring the RootSignature is often not the stage where a given
+      // sampler is live, so a per-stage decision here would drop the flag.
       output.Facts.HasStaticSamplerPolicy = true;
-      for (const string &name : dxilRootPolicy.StaticSamplerNames)
-        if (std::find(output.Facts.StaticSamplerNames.begin(),
-                      output.Facts.StaticSamplerNames.end(),
-                      name) == output.Facts.StaticSamplerNames.end())
-          output.Facts.StaticSamplerNames.push_back(name);
-      for (MetadataBindingFact &binding : output.Facts.Bindings) {
-        if (binding.Type !=
-            static_cast<uint32_t>(MetadataBindingKind::Sampler))
-          continue;
-        if (dxilRootPolicy.StaticSamplerNames.empty() ||
-            std::find(dxilRootPolicy.StaticSamplerNames.begin(),
-                      dxilRootPolicy.StaticSamplerNames.end(),
-                      binding.Name) != dxilRootPolicy.StaticSamplerNames.end())
-          binding.Flags |= kMetadataImmutableSampler;
+      for (const MetadataRootBindingFact &staticSampler :
+           dxilRootPolicy.StaticSamplerBindings) {
+        const auto found = std::find_if(
+            output.Facts.StaticSamplerBindings.begin(),
+            output.Facts.StaticSamplerBindings.end(),
+            [&](const MetadataRootBindingFact &value) noexcept {
+              return value.RegisterClass == staticSampler.RegisterClass &&
+                     value.Group == staticSampler.Group &&
+                     value.Binding == staticSampler.Binding;
+            });
+        if (found == output.Facts.StaticSamplerBindings.end())
+          output.Facts.StaticSamplerBindings.push_back(staticSampler);
       }
     }
   }
@@ -2330,6 +2588,74 @@ static_assert(sizeof(WireTypeRecord) == 40);
 static_assert(sizeof(WireRootConstantRecord) == 24);
 static_assert(sizeof(WireVertexInputRecord) == 28);
 
+// Stages only report the struct types reachable from their own live resources
+// (DXIL runs RemoveUnusedResources, SPIR-V filters by entry-point use), so the
+// per-stage Types arrays are merged as a union keyed by root struct name.
+// 2107 now means two stages saw the *same* struct with a different layout.
+bool MergeTypeFacts(vector<MetadataTypeFact> &target,
+                    const vector<MetadataTypeFact> &source,
+                    vector<Diagnostic> &diagnostics) {
+  const auto fail = [&diagnostics]() {
+    diagnostics.push_back({2107, "frontend stages disagree on type metadata"});
+    return false;
+  };
+  for (size_t index = 0; index < source.size();) {
+    const MetadataTypeFact &root = source[index];
+    if (root.ParentIndex != kMetadataNoParent)
+      return fail();
+    const size_t blockBegin = index;
+    size_t blockEnd = index + 1;
+    while (blockEnd < source.size() &&
+           source[blockEnd].ParentIndex == static_cast<uint32_t>(blockBegin))
+      ++blockEnd;
+    const auto found = std::find_if(
+        target.begin(), target.end(),
+        [&](const MetadataTypeFact &candidate) noexcept {
+          return candidate.ParentIndex == kMetadataNoParent &&
+                 candidate.Name == root.Name;
+        });
+    if (found == target.end()) {
+      const uint32_t newParent = static_cast<uint32_t>(target.size());
+      target.push_back(root);
+      target.back().TypeIndex = kMetadataNoType;
+      for (size_t field = blockBegin + 1; field < blockEnd; ++field) {
+        target.push_back(source[field]);
+        target.back().ParentIndex = newParent;
+        target.back().TypeIndex = kMetadataNoType;
+      }
+    } else {
+      const uint32_t targetRoot =
+          static_cast<uint32_t>(found - target.begin());
+      vector<size_t> targetFields;
+      for (size_t entry = 0; entry < target.size(); ++entry)
+        if (target[entry].ParentIndex == targetRoot)
+          targetFields.push_back(entry);
+      const size_t fieldCount = blockEnd - blockBegin - 1;
+      if (targetFields.size() != fieldCount ||
+          found->Kind != root.Kind ||
+          found->ElementCount != root.ElementCount ||
+          found->Offset != root.Offset || found->Size != root.Size ||
+          found->Stride != root.Stride ||
+          found->UnderlyingType != root.UnderlyingType)
+        return fail();
+      for (size_t field = 0; field < fieldCount; ++field) {
+        const MetadataTypeFact &left = target[targetFields[field]];
+        const MetadataTypeFact &right = source[blockBegin + 1 + field];
+        if (left.Name != right.Name || left.Kind != right.Kind ||
+            left.ElementCount != right.ElementCount ||
+            left.Offset != right.Offset || left.Size != right.Size ||
+            left.Stride != right.Stride ||
+            left.UnderlyingType != right.UnderlyingType)
+          return fail();
+      }
+    }
+    index = blockEnd;
+  }
+  if (!ResolveMetadataTypeIndices(target))
+    return fail();
+  return true;
+}
+
 bool MergeMetadataFacts(const ContractData &contract,
                         RadRayDxcTarget target,
                         const vector<StageOutput> &stages,
@@ -2338,14 +2664,18 @@ bool MergeMetadataFacts(const ContractData &contract,
   facts = {};
   for (const StageOutput &stage : stages) {
     const MetadataFacts &source = stage.Facts;
-    if (source.HasStaticSamplerPolicy) {
-      facts.HasStaticSamplerPolicy = true;
-      for (const string &name : source.StaticSamplerNames)
-        if (std::find(facts.StaticSamplerNames.begin(),
-                      facts.StaticSamplerNames.end(), name) ==
-            facts.StaticSamplerNames.end())
-          facts.StaticSamplerNames.push_back(name);
+    if (source.HasDxilRootPolicy) {
+      if (facts.HasDxilRootPolicy &&
+          !(facts.DxilRootPolicyHash == source.DxilRootPolicyHash)) {
+        diagnostics.push_back(
+            {2105, "graphics stages declare different RootSignature attributes"});
+        return false;
+      }
+      facts.HasDxilRootPolicy = true;
+      facts.DxilRootPolicyHash = source.DxilRootPolicyHash;
     }
+    if (source.HasStaticSamplerPolicy)
+      facts.HasStaticSamplerPolicy = true;
     for (const MetadataRootBindingFact &staticSampler : source.StaticSamplerBindings) {
       const auto found = std::find_if(
           facts.StaticSamplerBindings.begin(), facts.StaticSamplerBindings.end(),
@@ -2396,8 +2726,13 @@ bool MergeMetadataFacts(const ContractData &contract,
         facts.Bindings.push_back(binding);
       } else if (found->Group != binding.Group ||
                  found->Binding != binding.Binding ||
+                 found->RegisterClass != binding.RegisterClass ||
                  found->Type != binding.Type ||
-                 found->Count != binding.Count) {
+                 found->Count != binding.Count ||
+                 found->HasDxilRegister != binding.HasDxilRegister ||
+                 (found->HasDxilRegister &&
+                  (found->DxilRegisterSpace != binding.DxilRegisterSpace ||
+                   found->DxilRegisterNumber != binding.DxilRegisterNumber))) {
         diagnostics.push_back({2109, "frontend stages disagree on a resource binding"});
         return false;
       } else {
@@ -2406,25 +2741,8 @@ bool MergeMetadataFacts(const ContractData &contract,
       }
     }
 
-    if (facts.Types.empty()) {
-      facts.Types = source.Types;
-    } else if (!source.Types.empty()) {
-      if (facts.Types.size() != source.Types.size()) {
-        diagnostics.push_back({2107, "frontend stages disagree on type metadata"});
-        return false;
-      }
-      for (size_t index = 0; index < facts.Types.size(); ++index) {
-        const MetadataTypeFact &left = facts.Types[index];
-        const MetadataTypeFact &right = source.Types[index];
-        if (left.Name != right.Name || left.ParentIndex != right.ParentIndex ||
-            left.Kind != right.Kind || left.ElementCount != right.ElementCount ||
-            left.Offset != right.Offset || left.Size != right.Size ||
-            left.Stride != right.Stride || left.TypeIndex != right.TypeIndex) {
-          diagnostics.push_back({2107, "frontend stages disagree on type metadata"});
-          return false;
-        }
-      }
-    }
+    if (!MergeTypeFacts(facts.Types, source.Types, diagnostics))
+      return false;
 
     for (const MetadataRootConstantFact &constant : source.RootConstants) {
       const auto found = std::find_if(
@@ -2465,14 +2783,23 @@ bool MergeMetadataFacts(const ContractData &contract,
     return false;
   }
   if (target == RadRayDxcTarget::SPIRV && facts.HasStaticSamplerPolicy) {
+    // Associate on the authored DXIL register, matched against the merged
+    // RootSignature policy. A per-stage name association cannot work: the stage
+    // declaring the RootSignature need not be the stage where the sampler is
+    // live, and each probe only sees its own stage's surviving resources.
     for (MetadataBindingFact &binding : facts.Bindings) {
       if (binding.Type !=
-          static_cast<uint32_t>(MetadataBindingKind::Sampler))
+              static_cast<uint32_t>(MetadataBindingKind::Sampler) ||
+          !binding.HasDxilRegister)
         continue;
-      if (facts.StaticSamplerNames.empty() ||
-          std::find(facts.StaticSamplerNames.begin(),
-                    facts.StaticSamplerNames.end(),
-                    binding.Name) != facts.StaticSamplerNames.end())
+      if (std::any_of(facts.StaticSamplerBindings.begin(),
+                      facts.StaticSamplerBindings.end(),
+                      [&](const MetadataRootBindingFact &rootBinding) noexcept {
+                        return rootBinding.RegisterClass == 3u &&
+                               rootBinding.Group == binding.DxilRegisterSpace &&
+                               rootBinding.Binding ==
+                                   binding.DxilRegisterNumber;
+                      }))
         binding.Flags |= kMetadataImmutableSampler;
     }
   }
@@ -2515,13 +2842,6 @@ bool MergeMetadataFacts(const ContractData &contract,
   }
   for (MetadataRootConstantFact &constant : facts.RootConstants)
     constant.StageMask &= 0x7u;
-  if (target == RadRayDxcTarget::DXIL && facts.HasRootSignature) {
-    uint32_t allStageMask = 0;
-    for (const EntryPoint &entry : contract.EntryPoints)
-      allStageMask |= MetadataStageBitFor(entry.Stage);
-    for (MetadataRootConstantFact &constant : facts.RootConstants)
-      constant.StageMask = allStageMask;
-  }
   return true;
 }
 
@@ -3099,7 +3419,7 @@ public:
         return PublishResult(output, result);
       }
       if (EncodeContract(concreteContract) != EncodeContract(contract)) {
-        output->SetStatus(RadRayDxcCompileStatus::InvalidRequest);
+        output->SetStatus(RadRayDxcCompileStatus::ContractMismatch);
         output->AddDiagnostic(
             2007, "concrete assignments changed the frontend source contract");
         return PublishResult(output, result);

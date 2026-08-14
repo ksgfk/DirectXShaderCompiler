@@ -40,7 +40,9 @@ HRESULT CreateDxcOptimizer(REFIID riid, _Out_ LPVOID *ppv);
 HRESULT CreateDxcContainerBuilder(REFIID riid, _Out_ LPVOID *ppv);
 HRESULT CreateDxcLinker(REFIID riid, _Out_ LPVOID *ppv);
 HRESULT CreateDxcPdbUtils(REFIID riid, _Out_ LPVOID *ppv);
+#ifdef _WIN32
 HRESULT CreateRadRayDxcCompiler(REFIID riid, _Out_ LPVOID *ppv);
+#endif
 
 namespace hlsl {
 void CreateDxcContainerReflection(IDxcContainerReflection **ppResult);
@@ -75,8 +77,15 @@ static HRESULT ThreadMallocDxcCreateInstance(REFCLSID rclsid, REFIID riid,
   if (IsEqualCLSID(rclsid, CLSID_DxcCompiler)) {
     hr = CreateDxcCompiler(riid, ppv);
   } else if (IsEqualCLSID(rclsid,
-                          radray::shader::CLSID_RadRayDxcCompiler)) {
+                           radray::shader::CLSID_RadRayDxcCompiler)) {
+#ifdef _WIN32
     hr = CreateRadRayDxcCompiler(riid, ppv);
+#else
+    // The fork extension implementation is currently Windows-only. Keep the
+    // standard cross-platform factory linkable and fail closed until the
+    // extension itself is ported.
+    hr = REGDB_E_CLASSNOTREG;
+#endif
   } else if (IsEqualCLSID(rclsid, CLSID_DxcCompilerArgs)) {
     hr = CreateDxcCompilerArgs(riid, ppv);
   } else if (IsEqualCLSID(rclsid, CLSID_DxcUtils)) {

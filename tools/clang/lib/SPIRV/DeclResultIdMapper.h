@@ -207,6 +207,13 @@ public:
                             FeatureManager &features,
                             const SpirvCodeGenOptions &spirvOptions);
 
+  // Fork-private RadRay accessors: expose final-module stage/resource facts to
+  // the RadRay metadata observer. Not part of the upstream DXC interface.
+  llvm::ArrayRef<StageVar> getStageVarsForRadRay() const { return stageVars; }
+  llvm::ArrayRef<ResourceVar> getResourceVarsForRadRay() const {
+    return resourceVars;
+  }
+
   /// \brief Returns the SPIR-V builtin variable. Uses sc as default storage
   /// class.
   SpirvVariable *getBuiltinVar(spv::BuiltIn builtIn, QualType type,

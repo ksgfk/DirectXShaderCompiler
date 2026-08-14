@@ -174,6 +174,14 @@ public:
 
   llvm::ArrayRef<SpirvVariableLike *> getVariables() const { return variables; }
 
+  // Fork-private RadRay accessor: the final stage-IO locations only exist as
+  // module decorations after finalization, so the RadRay metadata observer
+  // reads them from here instead of recomputing an assignment.
+  std::vector<SpirvDecoration *> getDecorationsForRadRay() const {
+    return std::vector<SpirvDecoration *>(decorations.begin(),
+                                          decorations.end());
+  }
+
   llvm::ArrayRef<SpirvEntryPoint *> getEntryPoints() const {
     return entryPoints;
   }
