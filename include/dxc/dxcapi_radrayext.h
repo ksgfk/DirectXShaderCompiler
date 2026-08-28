@@ -27,7 +27,10 @@ inline constexpr IID IID_IRadRayDxcResult{
 
 inline constexpr uint32_t kRadRayDxcAbiVersion = 3;
 inline constexpr uint32_t kRadRayDxcLegacyMetadataSchemaVersion = 4;
-inline constexpr uint32_t kRadRayDxcMetadataSchemaVersion = 5;
+// Schema 6 replaces schema 5 outright: the binding kinds are logical rather
+// than register-class shaped, bindings carry a policy placement, root constants
+// carry their declaration name and Vulkan sampler states travel as records.
+inline constexpr uint32_t kRadRayDxcMetadataSchemaVersion = 6;
 inline constexpr uint32_t kRadRayDxcShaderWireMagic = 0x59524452u;
 inline constexpr uint16_t kRadRayDxcShaderWireSchemaVersion = 2;
 inline constexpr uint32_t kRadRayDxcDiscoveryWireMagic = 0x44524452u;

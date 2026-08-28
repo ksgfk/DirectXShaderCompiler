@@ -19,8 +19,13 @@
 #endif
 
 #include "clang/AST/Attr.h"
+#include "clang/AST/DeclTemplate.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/HlslTypes.h"
+#include "clang/Basic/Diagnostic.h"
+#include "clang/Basic/DiagnosticIDs.h"
+#include "clang/Basic/DiagnosticOptions.h"
+#include "clang/Parse/ParseHLSL.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/MultiplexConsumer.h"
 #include "clang/Lex/LiteralSupport.h"
@@ -32,11 +37,13 @@
 #include "dxc/DXIL/DxilCBuffer.h"
 #include "dxc/DXIL/DxilModule.h"
 #include "dxc/DXIL/DxilResource.h"
+#include "dxc/DxilContainer/DxilContainer.h"
 #include "dxc/DxilRootSignature/DxilRootSignature.h"
 #include "dxc/DXIL/DxilSampler.h"
 #include "dxc/DXIL/DxilSignature.h"
 #include "dxc/DXIL/DxilSignatureElement.h"
 #include "dxc/DXIL/DxilTypeSystem.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Casting.h"
@@ -84,9 +91,9 @@ using radray::shader::RadRayDxcTarget;
 // Toolchain identity gates artifact trust on the RadRay side. Bump both values
 // together whenever compiler output semantics change, then regenerate goldens.
 constexpr uint8_t kToolchainIdentity[16] = {
-    0x10, 0x02, 0x09, 0x01, 0x72, 0x61, 0x64, 0x72,
-    0x61, 0x79, 0x2d, 0x31, 0x2e, 0x39, 0x2e, 0x34};
-constexpr uint64_t kMetadataToolchainIdentity = 0x0000000001090210ull;
+    0x11, 0x02, 0x09, 0x01, 0x72, 0x61, 0x64, 0x72,
+    0x61, 0x79, 0x2d, 0x31, 0x2e, 0x39, 0x2e, 0x35};
+constexpr uint64_t kMetadataToolchainIdentity = 0x0000000001090211ull;
 constexpr uint32_t kMaxCollectionCount = 4096;
 
 struct Hash128 {
@@ -455,16 +462,40 @@ struct ContractData {
 constexpr uint32_t kMetadataNoParent = 0xffffffffu;
 constexpr uint32_t kMetadataNoType = 0xffffffffu;
 
+// Logical resource kind. Derived from the HLSL declaration type in the AST, so
+// both lanes publish the same kind for the same declaration by construction; a
+// lane's lowered form is only used to cross-check this value.
 enum class MetadataBindingKind : uint32_t {
+  Unknown = 0,
   CBuffer = 1,
-  Buffer = 2,
-  RWBuffer = 3,
-  Texture = 4,
-  RWTexture = 5,
-  Sampler = 6,
+  TypedBuffer = 2,
+  RWTypedBuffer = 3,
+  StructuredBuffer = 4,
+  RWStructuredBuffer = 5,
+  RawBuffer = 6,
+  RWRawBuffer = 7,
+  Texture = 8,
+  RWTexture = 9,
+  Sampler = 10,
 };
 
-constexpr uint32_t kMetadataImmutableSampler = 1u << 0;
+// Where the RootSignature policy places a declaration. Table is also the value
+// published when the source declares no policy at all.
+enum class MetadataBindingPlacement : uint32_t {
+  Table = 0,
+  RootDescriptor = 1,
+  StaticSampler = 2,
+};
+
+// Policy parameter classes, flattened from the versioned RootSignature desc.
+enum class MetadataPolicyKind : uint32_t {
+  Table = 0,
+  RootDescriptor = 1,
+  RootConstants = 2,
+  StaticSampler = 3,
+};
+
+constexpr uint32_t kMetadataNoSampler = 0xffffffffu;
 
 struct MetadataBindingFact {
   string Name;
@@ -475,13 +506,75 @@ struct MetadataBindingFact {
   uint32_t Count{1};
   uint32_t StageMask{0};
   uint32_t Flags{0};
-  // Authored DXIL register, carried on SPIR-V bindings only. The immutable
-  // sampler policy lives in the DXIL RootSignature, so associating it with a
-  // SPIR-V binding needs a key both lanes share; the Vulkan set/binding pair
-  // is not one. Absent on the DXIL lane, which matches on register directly.
-  bool HasDxilRegister{false};
-  uint32_t DxilRegisterSpace{0};
-  uint32_t DxilRegisterNumber{0};
+  uint32_t Placement{static_cast<uint32_t>(MetadataBindingPlacement::Table)};
+  // Index into MetadataFacts::Samplers. Only the SPIR-V lane fills it: a D3
+  // static sampler stays inside the serialized RootSignature carrier.
+  uint32_t SamplerIndex{kMetadataNoSampler};
+};
+
+// Immutable sampler state in Vulkan semantics. The numeric values mirror the
+// Vulkan enums so the consumer needs no translation table; the D3 static
+// sampler state is translated here because the policy mapping is compiler owned.
+struct MetadataSamplerFact {
+  uint32_t MagFilter{0};
+  uint32_t MinFilter{0};
+  uint32_t MipmapMode{0};
+  uint32_t AddressModeU{0};
+  uint32_t AddressModeV{0};
+  uint32_t AddressModeW{0};
+  float MipLodBias{0.0f};
+  uint32_t AnisotropyEnable{0};
+  float MaxAnisotropy{0.0f};
+  uint32_t CompareEnable{0};
+  uint32_t CompareOp{0};
+  float MinLod{0.0f};
+  float MaxLod{0.0f};
+  uint32_t BorderColor{0};
+  uint32_t ReductionMode{0};
+  uint32_t Flags{0};
+};
+
+bool SameSamplerFact(const MetadataSamplerFact &left,
+                     const MetadataSamplerFact &right) noexcept {
+  return left.MagFilter == right.MagFilter &&
+         left.MinFilter == right.MinFilter &&
+         left.MipmapMode == right.MipmapMode &&
+         left.AddressModeU == right.AddressModeU &&
+         left.AddressModeV == right.AddressModeV &&
+         left.AddressModeW == right.AddressModeW &&
+         left.MipLodBias == right.MipLodBias &&
+         left.AnisotropyEnable == right.AnisotropyEnable &&
+         left.MaxAnisotropy == right.MaxAnisotropy &&
+         left.CompareEnable == right.CompareEnable &&
+         left.CompareOp == right.CompareOp && left.MinLod == right.MinLod &&
+         left.MaxLod == right.MaxLod && left.BorderColor == right.BorderColor &&
+         left.ReductionMode == right.ReductionMode && left.Flags == right.Flags;
+}
+
+// AST-level declaration record. This is the only authority for logical kind,
+// array count and the DX register that associates a declaration with a policy
+// parameter, so no lane has to reconstruct any of it from lowered output.
+struct MetadataDeclarationFact {
+  string Name;
+  uint32_t Kind{static_cast<uint32_t>(MetadataBindingKind::Unknown)};
+  uint32_t Count{1};
+  bool HasRegister{false};
+  uint32_t RegisterSpace{0};
+  uint32_t RegisterNumber{0};
+  bool HasVkPushConstant{false};
+};
+
+// One RootSignature policy parameter, flattened to what the ADR-0051 mapping
+// table consumes. Descriptor table ranges become one entry per range.
+struct MetadataPolicyParameter {
+  uint32_t Kind{static_cast<uint32_t>(MetadataPolicyKind::Table)};
+  uint32_t RegisterClass{0};
+  uint32_t RegisterSpace{0};
+  uint32_t BaseRegister{0};
+  uint32_t RegisterCount{1};
+  uint32_t StageMask{0};
+  uint32_t Num32BitValues{0};
+  uint32_t SamplerIndex{kMetadataNoSampler};
 };
 
 struct MetadataTypeFact {
@@ -498,6 +591,9 @@ struct MetadataTypeFact {
 };
 
 struct MetadataRootConstantFact {
+  // Canonical declaration name. Push handles are built from it, so it is part
+  // of the wire payload rather than a compiler-internal label.
+  string Name;
   uint32_t RegisterSpace{0};
   uint32_t Register{0};
   uint32_t Offset{0};
@@ -515,28 +611,17 @@ struct MetadataVertexInputFact {
   uint32_t Flags{0};
 };
 
-struct MetadataRootBindingFact {
-  uint32_t RegisterClass{0};
-  uint32_t Binding{0};
-  uint32_t Group{0};
-};
-
 struct MetadataFacts {
   vector<MetadataBindingFact> Bindings;
   vector<MetadataTypeFact> Types;
   vector<MetadataRootConstantFact> RootConstants;
   vector<MetadataVertexInputFact> VertexInputs;
-  vector<MetadataRootBindingFact> RootBindings;
-  vector<MetadataRootBindingFact> StaticSamplerBindings;
+  // Immutable sampler states, in RootSignature static sampler order. SPIR-V
+  // only: the DXIL lane keeps the serialized carrier as its single authority.
+  vector<MetadataSamplerFact> Samplers;
   vector<uint8_t> SerializedRootSignature;
   Hash128 RootSignatureHash{};
-  // Auxiliary DXIL policy identity carried by SPIR-V stage facts. It is used
-  // only to reject conflicting graphics-stage RootSignatures and is never
-  // serialized into the SPIR-V lane.
-  Hash128 DxilRootPolicyHash{};
   bool HasRootSignature{false};
-  bool HasStaticSamplerPolicy{false};
-  bool HasDxilRootPolicy{false};
 };
 
 struct Diagnostic {
@@ -576,6 +661,32 @@ public:
 
 private:
   RadRayContractCollector &_collector;
+};
+
+// Captures the RootSignature parser's messages instead of letting them reach
+// the compile. The DXIL lane already reports them through codegen, so routing
+// them here keeps one stable RadRay diagnostic code per failure and avoids a
+// duplicate message, while still surfacing the parser's detail.
+class RadRayRootSignatureDiagnosticConsumer final
+    : public clang::DiagnosticConsumer {
+public:
+  void HandleDiagnostic(clang::DiagnosticsEngine::Level level,
+                        const clang::Diagnostic &info) override {
+    clang::DiagnosticConsumer::HandleDiagnostic(level, info);
+    if (level != clang::DiagnosticsEngine::Error &&
+        level != clang::DiagnosticsEngine::Fatal)
+      return;
+    llvm::SmallString<256> text;
+    info.FormatDiagnostic(text);
+    if (!_message.empty())
+      _message += "; ";
+    _message.append(text.begin(), text.end());
+  }
+
+  const string &Message() const noexcept { return _message; }
+
+private:
+  string _message;
 };
 
 class RadRayContractAstVisitor
@@ -695,7 +806,20 @@ public:
   void AddKeywordGroup(KeywordGroup group, clang::SourceLocation location,
                        bool isMainFile, uint32_t conditionDepth);
   void AddEntry(clang::FunctionDecl &decl, string stage);
-  void RecordDxilResourceBinding(const clang::NamedDecl &decl);
+  void RecordDeclaration(const clang::NamedDecl &decl,
+                         MetadataBindingKind kind, uint32_t count);
+  void RecordRootSignature(const clang::FunctionDecl &decl,
+                           const clang::HLSLRootSignatureAttr &attribute);
+  const MetadataDeclarationFact *FindDeclaration(string_view name) const {
+    for (const MetadataDeclarationFact &declaration : _declarations)
+      if (declaration.Name == name)
+        return &declaration;
+    return nullptr;
+  }
+  bool HasRootSignaturePolicy() const noexcept { return _hasRootSignature; }
+  const vector<uint8_t> &SerializedRootSignature() const noexcept {
+    return _rootSignatureBytes;
+  }
   void EnterCondition(clang::SourceLocation location) {
     _conditionStarts.push_back(location);
     ++_conditionDepth;
@@ -721,6 +845,10 @@ public:
 
   bool Finalize(ContractData &contract, vector<Diagnostic> &diagnostics) const;
 
+  // Applies the ADR-0051 mapping table to the declarations this lane found
+  // live. Called once per lane, after the lane published its bindings.
+  void ApplyRootSignaturePolicy();
+
   bool AppendDiagnostics(vector<Diagnostic> &diagnostics) const {
     diagnostics.insert(diagnostics.end(), _diagnostics.begin(), _diagnostics.end());
     return _diagnostics.empty();
@@ -739,6 +867,12 @@ private:
   friend class RadRayKeywordPragmaHandler;
   friend class RadRayContractAstVisitor;
 
+  bool FlattenRootSignaturePolicy(
+      const hlsl::DxilVersionedRootSignatureDesc &desc);
+  const MetadataPolicyParameter *FindPolicyParameter(uint32_t registerClass,
+                                                    uint32_t registerSpace,
+                                                    uint32_t registerNumber) const;
+
   string _sourceName;
   vector<KeywordGroup> _keywordGroups;
   vector<EntryPoint> _entryPoints;
@@ -751,6 +885,16 @@ private:
   ShaderStage _stage{ShaderStage::Vertex};
   MetadataFacts _metadata;
   vector<string> _dxilImplicitResourceNames;
+  // AST-owned policy frontend state. Both lanes read exactly these facts, so a
+  // lane never needs a second compile to learn the policy.
+  vector<MetadataDeclarationFact> _declarations;
+  vector<MetadataPolicyParameter> _policy;
+  vector<MetadataSamplerFact> _policySamplers;
+  string _rootSignatureSource;
+  vector<uint8_t> _rootSignatureBytes;
+  Hash128 _rootSignatureHash{};
+  bool _hasRootSignatureSource{false};
+  bool _hasRootSignature{false};
 #ifdef ENABLE_SPIRV_CODEGEN
   bool _sawPushConstant{false};
 #endif
@@ -824,19 +968,101 @@ void RadRayKeywordPragmaHandler::HandlePragma(
                              conditionDepth);
 }
 
-bool RadRayContractAstVisitor::VisitVarDecl(clang::VarDecl *decl) {
-  clang::QualType type = decl->getType();
-  while (const clang::ArrayType *array =
-             decl->getASTContext().getAsArrayType(type))
+// Resource object type name, matching the keyword table clang itself uses to
+// assign a resource class (CGHLSLMS KeywordToClass): the canonical record name
+// for a plain object, the template name for a templated one.
+string HlslResourceTypeName(const clang::ASTContext &context,
+                            clang::QualType type) {
+  type = type.getCanonicalType();
+  if (const clang::RecordType *record = type->getAsStructureType())
+    return record->getDecl()->getName().str();
+  if (const clang::RecordType *record = type->getAs<clang::RecordType>())
+    if (const auto *specialization =
+            llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(
+                record->getDecl()))
+      return specialization->getName().str();
+  return string();
+}
+
+// Logical kind for a declaration type name. Object types outside the RadRay
+// contract stay Unknown: they only become a diagnostic if the declaration turns
+// out to be live, so an unused exotic declaration is not a contract failure.
+MetadataBindingKind HlslResourceKindFromTypeName(const string &name) {
+  if (name == "SamplerState" || name == "SamplerComparisonState")
+    return MetadataBindingKind::Sampler;
+  if (name == "ConstantBuffer")
+    return MetadataBindingKind::CBuffer;
+  if (name == "Buffer")
+    return MetadataBindingKind::TypedBuffer;
+  if (name == "RWBuffer" || name == "RasterizerOrderedBuffer")
+    return MetadataBindingKind::RWTypedBuffer;
+  if (name == "StructuredBuffer")
+    return MetadataBindingKind::StructuredBuffer;
+  if (name == "RWStructuredBuffer" || name == "AppendStructuredBuffer" ||
+      name == "ConsumeStructuredBuffer" ||
+      name == "RasterizerOrderedStructuredBuffer")
+    return MetadataBindingKind::RWStructuredBuffer;
+  if (name == "ByteAddressBuffer")
+    return MetadataBindingKind::RawBuffer;
+  if (name == "RWByteAddressBuffer" ||
+      name == "RasterizerOrderedByteAddressBuffer")
+    return MetadataBindingKind::RWRawBuffer;
+  static const char *const kShapes[] = {"1D",      "1DArray", "2D",
+                                        "2DArray", "2DMS",    "2DMSArray",
+                                        "3D",      "Cube",    "CubeArray"};
+  for (const char *shape : kShapes) {
+    if (name == string("Texture") + shape)
+      return MetadataBindingKind::Texture;
+    if (name == string("RWTexture") + shape ||
+        name == string("RasterizerOrderedTexture") + shape)
+      return MetadataBindingKind::RWTexture;
+  }
+  return MetadataBindingKind::Unknown;
+}
+
+// Flattened declaration array count, 0 for an unbounded or non-constant extent.
+uint32_t HlslResourceArrayCount(const clang::ASTContext &context,
+                                clang::QualType &type) {
+  uint32_t count = 1;
+  while (const clang::ArrayType *array = context.getAsArrayType(type)) {
+    const auto *constant = llvm::dyn_cast<clang::ConstantArrayType>(array);
+    if (constant == nullptr) {
+      count = 0;
+    } else if (count != 0) {
+      const uint64_t extent = constant->getSize().getZExtValue();
+      const uint64_t total = static_cast<uint64_t>(count) * extent;
+      count = total == 0 || total > kMaxCollectionCount
+                  ? 0u
+                  : static_cast<uint32_t>(total);
+    }
     type = array->getElementType();
-  if (decl->isFileVarDecl() && hlsl::IsHLSLResourceType(type))
-    _collector.RecordDxilResourceBinding(*decl);
+  }
+  return count;
+}
+
+bool RadRayContractAstVisitor::VisitVarDecl(clang::VarDecl *decl) {
+  if (!decl->isFileVarDecl())
+    return true;
+  const clang::ASTContext &context = decl->getASTContext();
+  clang::QualType type = decl->getType();
+  const uint32_t count = HlslResourceArrayCount(context, type);
+  if (!hlsl::IsHLSLResourceType(type))
+    return true;
+  _collector.RecordDeclaration(
+      *decl, HlslResourceKindFromTypeName(HlslResourceTypeName(context, type)),
+      count);
   return true;
 }
 
 bool RadRayContractAstVisitor::VisitHLSLBufferDecl(
     clang::HLSLBufferDecl *decl) {
-  _collector.RecordDxilResourceBinding(*decl);
+  // tbuffer stays Unknown: it is a texture buffer on the DXIL side and has no
+  // place in the contract's logical kinds.
+  _collector.RecordDeclaration(*decl,
+                               decl->isCBuffer()
+                                   ? MetadataBindingKind::CBuffer
+                                   : MetadataBindingKind::Unknown,
+                               1);
   return true;
 }
 
@@ -851,6 +1077,11 @@ bool RadRayContractAstVisitor::VisitFunctionDecl(clang::FunctionDecl *decl) {
     return true;
   _seen.push_back(canonical);
   _collector.AddEntry(*decl, attribute->getStage().str());
+  // The policy is a translation-unit fact: every stage compile of the same
+  // Variant parses the same attribute, so the lanes cannot drift apart.
+  if (const clang::HLSLRootSignatureAttr *rootSignature =
+          decl->getAttr<clang::HLSLRootSignatureAttr>())
+    _collector.RecordRootSignature(*decl, *rootSignature);
   return true;
 }
 
@@ -1021,23 +1252,43 @@ void RadRayContractCollector::AddEntry(clang::FunctionDecl &decl,
   _entryPoints.push_back({decl.getName().str(), stage});
 }
 
-void RadRayContractCollector::RecordDxilResourceBinding(
-    const clang::NamedDecl &decl) {
-  if (_target != RadRayDxcTarget::DXIL)
+void RadRayContractCollector::RecordDeclaration(const clang::NamedDecl &decl,
+                                                MetadataBindingKind kind,
+                                                uint32_t count) {
+  const string name = decl.getNameAsString();
+  if (name.empty())
     return;
+  MetadataDeclarationFact fact;
+  fact.Name = name;
+  fact.Kind = static_cast<uint32_t>(kind);
+  fact.Count = count;
   for (const hlsl::UnusualAnnotation *annotation :
        decl.getUnusualAnnotations()) {
     const auto *assignment =
         llvm::dyn_cast<hlsl::RegisterAssignment>(annotation);
-    if (assignment != nullptr && assignment->RegisterType != 0)
-      return;
+    if (assignment == nullptr || assignment->RegisterType == 0)
+      continue;
+    fact.HasRegister = true;
+    fact.RegisterNumber = assignment->RegisterNumber;
+    fact.RegisterSpace = assignment->RegisterSpace.hasValue()
+                             ? assignment->RegisterSpace.getValue()
+                             : 0u;
   }
-  const string name = decl.getNameAsString();
-  if (!name.empty() &&
+  // Only observable on the SPIR-V lane, where the attribute is in the language;
+  // the DXIL lane associates a push declaration through its register instead.
+  fact.HasVkPushConstant = decl.hasAttr<clang::VKPushConstantAttr>();
+  // DXC has already assigned a register to every live resource by the time a
+  // lane reports it, so the authored annotation is the only way to tell an
+  // implicit assignment apart. Recorded before dead-resource removal, checked
+  // after it.
+  if (!fact.HasRegister &&
       std::find(_dxilImplicitResourceNames.begin(),
                 _dxilImplicitResourceNames.end(), name) ==
           _dxilImplicitResourceNames.end())
     _dxilImplicitResourceNames.push_back(name);
+  if (FindDeclaration(name) != nullptr)
+    return;
+  _declarations.push_back(std::move(fact));
 }
 
 bool RadRayContractCollector::Finalize(
@@ -1098,18 +1349,26 @@ uint32_t MetadataStageBitFor(ShaderStage stage) noexcept {
   return 1u << static_cast<uint8_t>(stage);
 }
 
+// D3D register class of a logical kind: b, t, u or s. Read-write kinds live in
+// the u namespace, read-only ones in t.
 uint32_t MetadataRegisterNamespace(MetadataBindingKind kind) noexcept {
   switch (kind) {
   case MetadataBindingKind::CBuffer:
     return 0;
-  case MetadataBindingKind::Buffer:
+  case MetadataBindingKind::TypedBuffer:
+  case MetadataBindingKind::StructuredBuffer:
+  case MetadataBindingKind::RawBuffer:
   case MetadataBindingKind::Texture:
     return 1;
-  case MetadataBindingKind::RWBuffer:
+  case MetadataBindingKind::RWTypedBuffer:
+  case MetadataBindingKind::RWStructuredBuffer:
+  case MetadataBindingKind::RWRawBuffer:
   case MetadataBindingKind::RWTexture:
     return 2;
   case MetadataBindingKind::Sampler:
     return 3;
+  case MetadataBindingKind::Unknown:
+    break;
   }
   return 0xffffffffu;
 }
@@ -1371,44 +1630,70 @@ uint32_t DxilRegisterClass(hlsl::DXIL::ResourceClass resourceClass) noexcept {
   return 0xffffffffu;
 }
 
+// Logical kind implied by the DXIL lowering. The declaration is the contract's
+// authority; this is the cross-check that catches a lowering which disagrees
+// with the declared type, and the fallback for a resource with no declaration.
 MetadataBindingKind DxilBindingKind(const hlsl::DxilResourceBase &resource) {
   if (resource.GetClass() == hlsl::DXIL::ResourceClass::CBuffer)
     return MetadataBindingKind::CBuffer;
   if (resource.GetClass() == hlsl::DXIL::ResourceClass::Sampler)
     return MetadataBindingKind::Sampler;
-  const auto kind = resource.GetKind();
-  const bool texture = hlsl::DxilResource::IsAnyTexture(kind);
+  const hlsl::DXIL::ResourceKind kind = resource.GetKind();
   const bool rw = resource.GetClass() == hlsl::DXIL::ResourceClass::UAV;
-  if (rw)
-    return texture ? MetadataBindingKind::RWTexture
-                   : MetadataBindingKind::RWBuffer;
-  return texture ? MetadataBindingKind::Texture : MetadataBindingKind::Buffer;
+  switch (kind) {
+  case hlsl::DXIL::ResourceKind::TypedBuffer:
+    return rw ? MetadataBindingKind::RWTypedBuffer
+              : MetadataBindingKind::TypedBuffer;
+  case hlsl::DXIL::ResourceKind::StructuredBuffer:
+    return rw ? MetadataBindingKind::RWStructuredBuffer
+              : MetadataBindingKind::StructuredBuffer;
+  case hlsl::DXIL::ResourceKind::RawBuffer:
+    return rw ? MetadataBindingKind::RWRawBuffer
+              : MetadataBindingKind::RawBuffer;
+  default:
+    break;
+  }
+  if (hlsl::DxilResource::IsAnyTexture(kind))
+    return rw ? MetadataBindingKind::RWTexture : MetadataBindingKind::Texture;
+  return MetadataBindingKind::Unknown;
 }
 
 void AddDxilResourceFact(const hlsl::DxilResourceBase &resource,
-                         MetadataFacts &facts, ShaderStage stage) {
+                         const MetadataDeclarationFact *declaration,
+                         MetadataFacts &facts, ShaderStage stage,
+                         vector<Diagnostic> &diagnostics) {
   const uint32_t registerClass = DxilRegisterClass(resource.GetClass());
   if (registerClass == 0xffffffffu)
     return;
-  const MetadataBindingKind kind = DxilBindingKind(resource);
+  const string name = resource.GetGlobalName();
+  const MetadataBindingKind lowered = DxilBindingKind(resource);
+  const MetadataBindingKind kind =
+      declaration != nullptr
+          ? static_cast<MetadataBindingKind>(declaration->Kind)
+          : lowered;
+  if (kind == MetadataBindingKind::Unknown) {
+    diagnostics.push_back(
+        {2118, "resource '" + name +
+                   "' has a declaration type outside the RadRay shader contract"});
+    return;
+  }
+  if (lowered != MetadataBindingKind::Unknown && lowered != kind) {
+    diagnostics.push_back(
+        {2119, "resource '" + name +
+                   "' logical kind disagrees with its DXIL lowering"});
+    return;
+  }
   const uint32_t binding = resource.GetLowerBound();
   const uint32_t group = resource.GetSpaceID() == UINT_MAX
                              ? 0u
                              : resource.GetSpaceID();
-  MetadataBindingFact *fact = AddMetadataBinding(
-      facts, resource.GetGlobalName(), group, binding, kind,
-      resource.GetRangeSize(), stage);
-  if (fact != nullptr) {
+  const uint32_t count = declaration != nullptr && declaration->Count != 0
+                             ? declaration->Count
+                             : resource.GetRangeSize();
+  MetadataBindingFact *fact =
+      AddMetadataBinding(facts, name, group, binding, kind, count, stage);
+  if (fact != nullptr)
     fact->RegisterClass = registerClass;
-  }
-}
-
-void AddDxilRootBinding(vector<MetadataRootBindingFact> &rootBindings,
-                        uint32_t registerClass, uint32_t binding,
-                        uint32_t group, uint32_t count = 1) {
-  const uint32_t boundedCount = std::min(count, kMaxCollectionCount);
-  for (uint32_t index = 0; index < std::max(1u, boundedCount); ++index)
-    rootBindings.push_back({registerClass, binding + index, group});
 }
 
 uint32_t DxilRootRangeClass(hlsl::DxilDescriptorRangeType type) noexcept {
@@ -1445,142 +1730,485 @@ uint32_t RootVisibilityStageMask(hlsl::DxilShaderVisibility visibility,
   }
 }
 
-void ValidateDxilRootSignature(const hlsl::DxilVersionedRootSignatureDesc &root,
-                               MetadataFacts &facts,
-                               ShaderStage stage,
-                               vector<Diagnostic> &diagnostics) {
-  vector<MetadataRootBindingFact> rootBindings;
-  vector<MetadataRootBindingFact> staticSamplerBindings;
-  const auto addParameter = [&](hlsl::DxilRootParameterType type,
-                                uint32_t registerClass, uint32_t binding,
-                                uint32_t group) {
-    if (type != hlsl::DxilRootParameterType::Constants32Bit)
-      AddDxilRootBinding(rootBindings, registerClass, binding, group);
+// Vulkan-semantics translation of a D3D static sampler. The stored numbers are
+// the official Vulkan enumerant values so the backend can consume them without
+// a second mapping table; the RadRay side static_asserts them against volk.
+MetadataSamplerFact
+MetadataSamplerFromStatic(const hlsl::DxilStaticSamplerDesc &desc) {
+  const auto addressMode = [](hlsl::DxilTextureAddressMode mode) -> uint32_t {
+    switch (mode) {
+    case hlsl::DxilTextureAddressMode::Wrap:
+      return 0; // VK_SAMPLER_ADDRESS_MODE_REPEAT
+    case hlsl::DxilTextureAddressMode::Mirror:
+      return 1; // VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT
+    case hlsl::DxilTextureAddressMode::Clamp:
+      return 2; // VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+    case hlsl::DxilTextureAddressMode::Border:
+      return 3; // VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER
+    case hlsl::DxilTextureAddressMode::MirrorOnce:
+      return 4; // VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE
+    default:
+      return 0;
+    }
   };
-  const auto addRange = [&](const hlsl::DxilDescriptorRange &range) {
-    const uint32_t registerClass = DxilRootRangeClass(range.RangeType);
-    if (registerClass != 0xffffffffu)
-      AddDxilRootBinding(rootBindings, registerClass,
-                         range.BaseShaderRegister, range.RegisterSpace,
-                         range.NumDescriptors);
+  const auto borderColor = [](hlsl::DxilStaticBorderColor color) -> uint32_t {
+    switch (color) {
+    case hlsl::DxilStaticBorderColor::TransparentBlack:
+      return 0; // VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK
+    case hlsl::DxilStaticBorderColor::OpaqueBlack:
+      return 2; // VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK
+    case hlsl::DxilStaticBorderColor::OpaqueWhite:
+      return 4; // VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE
+    case hlsl::DxilStaticBorderColor::OpaqueBlackUint:
+      return 3; // VK_BORDER_COLOR_INT_OPAQUE_BLACK
+    case hlsl::DxilStaticBorderColor::OpaqueWhiteUint:
+      return 5; // VK_BORDER_COLOR_INT_OPAQUE_WHITE
+    default:
+      return 0;
+    }
   };
-  const auto addRange1 = [&](const hlsl::DxilDescriptorRange1 &range) {
-    const uint32_t registerClass = DxilRootRangeClass(range.RangeType);
-    if (registerClass != 0xffffffffu)
-      AddDxilRootBinding(rootBindings, registerClass,
-                         range.BaseShaderRegister, range.RegisterSpace,
-                         range.NumDescriptors);
+  // D3D filter bit layout: mip at bit 0, mag at bit 2, min at bit 4, the
+  // anisotropic bit at 0x40 and the reduction type at bits 7-8.
+  const uint32_t filter = static_cast<uint32_t>(desc.Filter);
+  const bool anisotropic = (filter & 0x40u) != 0u;
+  const uint32_t reduction = (filter >> 7) & 0x3u;
+  const auto filterType = [&](uint32_t shift) -> uint32_t {
+    return anisotropic || ((filter >> shift) & 0x3u) != 0u ? 1u : 0u;
+  };
+
+  MetadataSamplerFact fact;
+  fact.MipmapMode = filterType(0);
+  fact.MagFilter = filterType(2);
+  fact.MinFilter = filterType(4);
+  fact.AddressModeU = addressMode(desc.AddressU);
+  fact.AddressModeV = addressMode(desc.AddressV);
+  fact.AddressModeW = addressMode(desc.AddressW);
+  fact.MipLodBias = desc.MipLODBias;
+  fact.AnisotropyEnable = anisotropic ? 1u : 0u;
+  // Vulkan requires maxAnisotropy >= 1.0 whenever the feature is enabled and
+  // ignores it otherwise.
+  fact.MaxAnisotropy =
+      anisotropic ? std::max(1.0f, static_cast<float>(desc.MaxAnisotropy))
+                  : 1.0f;
+  fact.CompareEnable = reduction == 1u ? 1u : 0u;
+  fact.CompareOp =
+      desc.ComparisonFunc == hlsl::DxilComparisonFunc::None
+          ? 0u
+          : static_cast<uint32_t>(desc.ComparisonFunc) - 1u;
+  fact.MinLod = desc.MinLOD;
+  // An open-ended D3D clamp becomes VK_LOD_CLAMP_NONE.
+  fact.MaxLod = desc.MaxLOD >= DxilFloat32Max ? 1000.0f : desc.MaxLOD;
+  fact.BorderColor = borderColor(desc.BorderColor);
+  fact.ReductionMode = reduction == 2u ? 1u : reduction == 3u ? 2u : 0u;
+  fact.Flags = 0u;
+  return fact;
+}
+
+uint32_t
+MetadataRootDescriptorClass(hlsl::DxilRootParameterType type) noexcept {
+  switch (type) {
+  case hlsl::DxilRootParameterType::CBV:
+    return 0;
+  case hlsl::DxilRootParameterType::SRV:
+    return 1;
+  case hlsl::DxilRootParameterType::UAV:
+    return 2;
+  default:
+    return 0xffffffffu;
+  }
+}
+
+// True when a policy parameter covers a single register slot. Unbounded ranges
+// (NumDescriptors == UINT_MAX) cover everything from the base upwards.
+bool MetadataPolicyCovers(const MetadataPolicyParameter &parameter,
+                         uint32_t registerClass, uint32_t registerSpace,
+                         uint32_t registerNumber) noexcept {
+  if (parameter.RegisterClass != registerClass ||
+      parameter.RegisterSpace != registerSpace ||
+      registerNumber < parameter.BaseRegister)
+    return false;
+  if (parameter.RegisterCount == UINT_MAX)
+    return true;
+  return registerNumber - parameter.BaseRegister < parameter.RegisterCount;
+}
+
+bool MetadataPolicyOverlaps(const MetadataPolicyParameter &lhs,
+                            const MetadataPolicyParameter &rhs) noexcept {
+  if (lhs.RegisterClass != rhs.RegisterClass ||
+      lhs.RegisterSpace != rhs.RegisterSpace)
+    return false;
+  const auto last = [](const MetadataPolicyParameter &value) -> uint64_t {
+    if (value.RegisterCount == UINT_MAX || value.RegisterCount == 0)
+      return UINT_MAX;
+    return static_cast<uint64_t>(value.BaseRegister) + value.RegisterCount - 1;
+  };
+  return lhs.BaseRegister <= last(rhs) && rhs.BaseRegister <= last(lhs);
+}
+
+void RadRayContractCollector::RecordRootSignature(
+    const clang::FunctionDecl &decl,
+    const clang::HLSLRootSignatureAttr &attribute) {
+  const string source = attribute.getSignatureName().str();
+  if (_hasRootSignatureSource) {
+    // Every stage compile of one Variant sees the whole translation unit, so the
+    // policy has to be a single translation-unit fact for the lanes to agree.
+    if (source != _rootSignatureSource)
+      AddDiagnostic(2105, "translation unit declares more than one distinct "
+                          "[RootSignature] policy");
+    return;
+  }
+  _hasRootSignatureSource = true;
+  _rootSignatureSource = source;
+
+  clang::ASTContext &context = decl.getASTContext();
+  const hlsl::DxilRootSignatureVersion version =
+      context.getLangOpts().RootSigMinor == 0
+          ? hlsl::DxilRootSignatureVersion::Version_1_0
+          : hlsl::DxilRootSignatureVersion::Version_1_1;
+  // A private engine: on the DXIL lane codegen parses the same attribute and
+  // would report the identical message, so routing the parser here keeps one
+  // stable RadRay code per failure instead of a duplicated clang error.
+  RadRayRootSignatureDiagnosticConsumer consumer;
+  llvm::IntrusiveRefCntPtr<clang::DiagnosticIDs> ids(new clang::DiagnosticIDs());
+  llvm::IntrusiveRefCntPtr<clang::DiagnosticOptions> options(
+      new clang::DiagnosticOptions());
+  clang::DiagnosticsEngine diagnostics(ids, options.get(), &consumer, false);
+  diagnostics.setSourceManager(&context.getSourceManager());
+  hlsl::RootSignatureHandle handle;
+  clang::CompileRootSignature(
+      source, diagnostics, decl.getLocation(), version,
+      hlsl::DxilRootSignatureCompilationFlags::GlobalRootSignature, &handle);
+  if (handle.IsEmpty() || diagnostics.hasErrorOccurred()) {
+    AddDiagnostic(2117, "[RootSignature] could not be compiled: " +
+                            (consumer.Message().empty()
+                                 ? string("unknown root signature error")
+                                 : consumer.Message()));
+    return;
+  }
+  handle.EnsureSerializedAvailable();
+  const uint8_t *serialized = handle.GetSerializedBytes();
+  const uint32_t serializedSize = handle.GetSerializedSize();
+  if (serialized == nullptr || serializedSize == 0) {
+    AddDiagnostic(2117, "[RootSignature] produced no serialized payload");
+    return;
+  }
+  const hlsl::DxilVersionedRootSignatureDesc *desc = handle.GetDesc();
+  if (desc == nullptr) {
+    AddDiagnostic(2117, "[RootSignature] produced no decoded description");
+    return;
+  }
+  if (!FlattenRootSignaturePolicy(*desc))
+    return;
+  _rootSignatureBytes.assign(serialized, serialized + serializedSize);
+  _rootSignatureHash = Digest(_rootSignatureBytes, 0x52534947ull);
+  _hasRootSignature = true;
+}
+
+bool RadRayContractCollector::FlattenRootSignaturePolicy(
+    const hlsl::DxilVersionedRootSignatureDesc &root) {
+  _policy.clear();
+  _policySamplers.clear();
+  bool ok = true;
+  const auto addRange = [&](uint32_t rangeType, uint32_t baseRegister,
+                            uint32_t registerSpace, uint32_t numDescriptors,
+                            uint32_t stageMask) {
+    const uint32_t registerClass = DxilRootRangeClass(
+        static_cast<hlsl::DxilDescriptorRangeType>(rangeType));
+    if (registerClass == 0xffffffffu) {
+      AddDiagnostic(2117, "[RootSignature] descriptor range type is outside the "
+                          "RadRay shader contract");
+      ok = false;
+      return;
+    }
+    MetadataPolicyParameter parameter;
+    parameter.Kind = static_cast<uint32_t>(MetadataPolicyKind::Table);
+    parameter.RegisterClass = registerClass;
+    parameter.RegisterSpace = registerSpace;
+    parameter.BaseRegister = baseRegister;
+    parameter.RegisterCount = numDescriptors;
+    parameter.StageMask = stageMask;
+    _policy.push_back(parameter);
+  };
+  const auto addParameters = [&](const auto *parameters,
+                                 uint32_t numParameters) {
+    for (uint32_t index = 0; index < numParameters; ++index) {
+      const auto &parameter = parameters[index];
+      const uint32_t stageMask =
+          RootVisibilityStageMask(parameter.ShaderVisibility, _stage);
+      if (parameter.ParameterType ==
+          hlsl::DxilRootParameterType::DescriptorTable) {
+        for (uint32_t rangeIndex = 0;
+             rangeIndex < parameter.DescriptorTable.NumDescriptorRanges;
+             ++rangeIndex) {
+          const auto &range =
+              parameter.DescriptorTable.pDescriptorRanges[rangeIndex];
+          addRange(static_cast<uint32_t>(range.RangeType),
+                   range.BaseShaderRegister, range.RegisterSpace,
+                   range.NumDescriptors, stageMask);
+        }
+        continue;
+      }
+      if (parameter.ParameterType ==
+          hlsl::DxilRootParameterType::Constants32Bit) {
+        MetadataPolicyParameter constants;
+        constants.Kind =
+            static_cast<uint32_t>(MetadataPolicyKind::RootConstants);
+        constants.RegisterClass = 0u;
+        constants.RegisterSpace = parameter.Constants.RegisterSpace;
+        constants.BaseRegister = parameter.Constants.ShaderRegister;
+        constants.RegisterCount = 1u;
+        constants.StageMask = stageMask;
+        constants.Num32BitValues = parameter.Constants.Num32BitValues;
+        _policy.push_back(constants);
+        continue;
+      }
+      const uint32_t registerClass =
+          MetadataRootDescriptorClass(parameter.ParameterType);
+      if (registerClass == 0xffffffffu) {
+        AddDiagnostic(2117, "[RootSignature] root parameter type is outside the "
+                            "RadRay shader contract");
+        ok = false;
+        continue;
+      }
+      MetadataPolicyParameter descriptor;
+      descriptor.Kind =
+          static_cast<uint32_t>(MetadataPolicyKind::RootDescriptor);
+      descriptor.RegisterClass = registerClass;
+      descriptor.RegisterSpace = parameter.Descriptor.RegisterSpace;
+      descriptor.BaseRegister = parameter.Descriptor.ShaderRegister;
+      descriptor.RegisterCount = 1u;
+      descriptor.StageMask = stageMask;
+      _policy.push_back(descriptor);
+    }
+  };
+  const auto addStaticSamplers = [&](const hlsl::DxilStaticSamplerDesc *samplers,
+                                     uint32_t numSamplers) {
+    for (uint32_t index = 0; index < numSamplers; ++index) {
+      const hlsl::DxilStaticSamplerDesc &sampler = samplers[index];
+      MetadataPolicyParameter parameter;
+      parameter.Kind = static_cast<uint32_t>(MetadataPolicyKind::StaticSampler);
+      parameter.RegisterClass = 3u;
+      parameter.RegisterSpace = sampler.RegisterSpace;
+      parameter.BaseRegister = sampler.ShaderRegister;
+      parameter.RegisterCount = 1u;
+      parameter.StageMask =
+          RootVisibilityStageMask(sampler.ShaderVisibility, _stage);
+      // The whole static sampler table is published, referenced or not, so the
+      // sampler index of a given slot does not depend on shader liveness.
+      parameter.SamplerIndex = static_cast<uint32_t>(_policySamplers.size());
+      _policySamplers.push_back(MetadataSamplerFromStatic(sampler));
+      _policy.push_back(parameter);
+    }
   };
 
   if (root.Version == hlsl::DxilRootSignatureVersion::Version_1_1) {
-    const auto &desc = root.Desc_1_1;
-    for (uint32_t index = 0; index < desc.NumParameters; ++index) {
-      const hlsl::DxilRootParameter1 &parameter = desc.pParameters[index];
-      if (parameter.ParameterType == hlsl::DxilRootParameterType::DescriptorTable) {
-        for (uint32_t rangeIndex = 0;
-             rangeIndex < parameter.DescriptorTable.NumDescriptorRanges;
-             ++rangeIndex)
-          addRange1(parameter.DescriptorTable.pDescriptorRanges[rangeIndex]);
-      } else if (parameter.ParameterType ==
-                 hlsl::DxilRootParameterType::Constants32Bit) {
-        facts.RootConstants.push_back(
-            {parameter.Constants.RegisterSpace, parameter.Constants.ShaderRegister,
-             0u, parameter.Constants.Num32BitValues * 4u,
-             RootVisibilityStageMask(parameter.ShaderVisibility, stage), 0u});
-      } else {
-        const uint32_t registerClass =
-            parameter.ParameterType == hlsl::DxilRootParameterType::CBV
-                ? 0u
-                : parameter.ParameterType == hlsl::DxilRootParameterType::SRV
-                      ? 1u
-                      : 2u;
-        addParameter(parameter.ParameterType, registerClass,
-                     parameter.Descriptor.ShaderRegister,
-                     parameter.Descriptor.RegisterSpace);
-      }
-    }
-    for (uint32_t index = 0; index < desc.NumStaticSamplers; ++index) {
-      const auto &sampler = desc.pStaticSamplers[index];
-      AddDxilRootBinding(rootBindings, 3u, sampler.ShaderRegister,
-                         sampler.RegisterSpace);
-      AddDxilRootBinding(staticSamplerBindings, 3u, sampler.ShaderRegister,
-                         sampler.RegisterSpace);
-    }
+    addParameters(root.Desc_1_1.pParameters, root.Desc_1_1.NumParameters);
+    addStaticSamplers(root.Desc_1_1.pStaticSamplers,
+                      root.Desc_1_1.NumStaticSamplers);
   } else {
-    const auto &desc = root.Desc_1_0;
-    for (uint32_t index = 0; index < desc.NumParameters; ++index) {
-      const hlsl::DxilRootParameter &parameter = desc.pParameters[index];
-      if (parameter.ParameterType == hlsl::DxilRootParameterType::DescriptorTable) {
-        for (uint32_t rangeIndex = 0;
-             rangeIndex < parameter.DescriptorTable.NumDescriptorRanges;
-             ++rangeIndex)
-          addRange(parameter.DescriptorTable.pDescriptorRanges[rangeIndex]);
-      } else if (parameter.ParameterType ==
-                 hlsl::DxilRootParameterType::Constants32Bit) {
-        facts.RootConstants.push_back(
-            {parameter.Constants.RegisterSpace, parameter.Constants.ShaderRegister,
-             0u, parameter.Constants.Num32BitValues * 4u,
-             RootVisibilityStageMask(parameter.ShaderVisibility, stage), 0u});
-      } else {
-        const uint32_t registerClass =
-            parameter.ParameterType == hlsl::DxilRootParameterType::CBV
-                ? 0u
-                : parameter.ParameterType == hlsl::DxilRootParameterType::SRV
-                      ? 1u
-                      : 2u;
-        addParameter(parameter.ParameterType, registerClass,
-                     parameter.Descriptor.ShaderRegister,
-                     parameter.Descriptor.RegisterSpace);
+    addParameters(root.Desc_1_0.pParameters, root.Desc_1_0.NumParameters);
+    addStaticSamplers(root.Desc_1_0.pStaticSamplers,
+                      root.Desc_1_0.NumStaticSamplers);
+  }
+
+  // Overlapping register ranges would make the placement of a binding
+  // ambiguous. D3D12 rejects them too, so this only ever fires before the
+  // runtime would.
+  for (size_t left = 0; left + 1 < _policy.size(); ++left)
+    for (size_t right = left + 1; right < _policy.size(); ++right)
+      if (MetadataPolicyOverlaps(_policy[left], _policy[right])) {
+        AddDiagnostic(2104, "[RootSignature] covers the same register range "
+                            "more than once");
+        return false;
       }
+  return ok;
+}
+
+const MetadataPolicyParameter *RadRayContractCollector::FindPolicyParameter(
+    uint32_t registerClass, uint32_t registerSpace,
+    uint32_t registerNumber) const {
+  for (const MetadataPolicyParameter &parameter : _policy)
+    if (MetadataPolicyCovers(parameter, registerClass, registerSpace,
+                             registerNumber))
+      return &parameter;
+  return nullptr;
+}
+
+void RadRayContractCollector::ApplyRootSignaturePolicy() {
+  const uint32_t stageBit = MetadataStageBitFor(_stage);
+  if (!_hasRootSignature) {
+    // No policy: everything stays in a descriptor table and the lane's own
+    // observations are published unchanged. Push blocks still gain their
+    // declaration name, which is a translation-unit fact either way.
+    for (MetadataRootConstantFact &constants : _metadata.RootConstants) {
+      if (!constants.Name.empty())
+        continue;
+      for (const MetadataDeclarationFact &declaration : _declarations)
+        if (declaration.HasRegister &&
+            declaration.RegisterSpace == constants.RegisterSpace &&
+            declaration.RegisterNumber == constants.Register)
+          constants.Name = declaration.Name;
     }
-    for (uint32_t index = 0; index < desc.NumStaticSamplers; ++index) {
-      const auto &sampler = desc.pStaticSamplers[index];
-      AddDxilRootBinding(rootBindings, 3u, sampler.ShaderRegister,
-                         sampler.RegisterSpace);
-      AddDxilRootBinding(staticSamplerBindings, 3u, sampler.ShaderRegister,
-                         sampler.RegisterSpace);
-    }
+    return;
   }
 
-  facts.HasStaticSamplerPolicy = !staticSamplerBindings.empty();
-
-  for (const MetadataRootBindingFact &staticSampler : staticSamplerBindings) {
-    const auto found = std::find_if(
-        facts.StaticSamplerBindings.begin(), facts.StaticSamplerBindings.end(),
-        [&](const MetadataRootBindingFact &value) noexcept {
-          return value.RegisterClass == staticSampler.RegisterClass &&
-                 value.Group == staticSampler.Group &&
-                 value.Binding == staticSampler.Binding;
-        });
-    if (found == facts.StaticSamplerBindings.end())
-      facts.StaticSamplerBindings.push_back(staticSampler);
+  // The hash identifies the policy itself, so it is taken over the frontend's
+  // raw serialized bytes on both lanes even though only D3D ships a carrier.
+  _metadata.RootSignatureHash = _rootSignatureHash;
+  _metadata.HasRootSignature = true;
+  if (_target == RadRayDxcTarget::DXIL) {
+    // D3D's explicit topology lives in the serialized carrier, which stays the
+    // single authority for static samplers there.
+    _metadata.SerializedRootSignature = _rootSignatureBytes;
+  } else {
+    // Vulkan builds its immutable samplers from the records instead.
+    _metadata.Samplers = _policySamplers;
   }
 
-  for (const MetadataRootBindingFact &rootBinding : rootBindings) {
-    const auto found = std::find_if(
-        facts.RootBindings.begin(), facts.RootBindings.end(),
-        [&](const MetadataRootBindingFact &value) noexcept {
-          return value.RegisterClass == rootBinding.RegisterClass &&
-                 value.Group == rootBinding.Group &&
-                 value.Binding == rootBinding.Binding;
-        });
-    if (found != facts.RootBindings.end())
+  // What this lane actually observed as a push block, checked against the
+  // policy before the policy-derived records replace it.
+  const vector<MetadataRootConstantFact> observed = _metadata.RootConstants;
+  _metadata.RootConstants.clear();
+
+  vector<MetadataBindingFact> bindings;
+  bindings.reserve(_metadata.Bindings.size());
+  for (MetadataBindingFact &binding : _metadata.Bindings) {
+    const MetadataDeclarationFact *declaration = FindDeclaration(binding.Name);
+    const MetadataPolicyParameter *parameter =
+        declaration != nullptr && declaration->HasRegister
+            ? FindPolicyParameter(binding.RegisterClass,
+                                  declaration->RegisterSpace,
+                                  declaration->RegisterNumber)
+            : nullptr;
+    if (parameter == nullptr) {
+      // The DXIL lane sees every resource the policy has to cover. A resource
+      // with no D3D register cannot be addressed by the policy at all, so on the
+      // SPIR-V lane it is target-only and stays in a descriptor table.
+      if (_target == RadRayDxcTarget::DXIL)
+        AddDiagnostic(2121, "resource '" + binding.Name +
+                                "' is not covered by the [RootSignature] policy");
+      bindings.push_back(std::move(binding));
       continue;
-    facts.RootBindings.push_back(rootBinding);
+    }
+    if ((parameter->StageMask & stageBit) == 0u) {
+      AddDiagnostic(2123, "resource '" + binding.Name +
+                              "' is used by a stage the [RootSignature] policy "
+                              "does not make it visible to");
+      continue;
+    }
+    const MetadataPolicyKind kind =
+        static_cast<MetadataPolicyKind>(parameter->Kind);
+    const MetadataBindingKind bindingKind =
+        static_cast<MetadataBindingKind>(binding.Type);
+    if (kind == MetadataPolicyKind::RootConstants) {
+      // A push block is not a descriptor on either lane. The record itself is
+      // rebuilt from the policy below.
+      if (_target != RadRayDxcTarget::DXIL)
+        AddDiagnostic(2124, "resource '" + binding.Name +
+                                "' is root constants in the policy but a "
+                                "descriptor on the SPIR-V lane; it needs "
+                                "[[vk::push_constant]]");
+      continue;
+    }
+    if (kind == MetadataPolicyKind::StaticSampler) {
+      if (bindingKind != MetadataBindingKind::Sampler) {
+        AddDiagnostic(2122, "resource '" + binding.Name +
+                                "' is not a sampler but the policy places it in "
+                                "a static sampler slot");
+        continue;
+      }
+      // D3D keeps a static sampler inside the serialized carrier, so it owns no
+      // table slot; Vulkan binds it as an immutable sampler in the set.
+      if (_target == RadRayDxcTarget::DXIL) {
+        binding.Placement =
+            static_cast<uint32_t>(MetadataBindingPlacement::StaticSampler);
+      } else {
+        binding.Placement =
+            static_cast<uint32_t>(MetadataBindingPlacement::Table);
+        binding.SamplerIndex = parameter->SamplerIndex;
+      }
+      bindings.push_back(std::move(binding));
+      continue;
+    }
+    if (kind == MetadataPolicyKind::RootDescriptor) {
+      const bool addressable = bindingKind == MetadataBindingKind::CBuffer ||
+                               bindingKind ==
+                                   MetadataBindingKind::StructuredBuffer ||
+                               bindingKind ==
+                                   MetadataBindingKind::RWStructuredBuffer ||
+                               bindingKind == MetadataBindingKind::RawBuffer ||
+                               bindingKind == MetadataBindingKind::RWRawBuffer;
+      if (!addressable || binding.Count != 1u) {
+        AddDiagnostic(2122, "resource '" + binding.Name +
+                                "' cannot be a root descriptor: only a single "
+                                "buffer or constant buffer can be bound by "
+                                "address");
+        continue;
+      }
+      binding.Placement =
+          static_cast<uint32_t>(MetadataBindingPlacement::RootDescriptor);
+      bindings.push_back(std::move(binding));
+      continue;
+    }
+    binding.Placement = static_cast<uint32_t>(MetadataBindingPlacement::Table);
+    bindings.push_back(std::move(binding));
+  }
+  _metadata.Bindings = std::move(bindings);
+
+  for (const MetadataRootConstantFact &fact : observed) {
+    const MetadataPolicyParameter *parameter =
+        FindPolicyParameter(0u, fact.RegisterSpace, fact.Register);
+    if (parameter == nullptr ||
+        parameter->Kind !=
+            static_cast<uint32_t>(MetadataPolicyKind::RootConstants)) {
+      AddDiagnostic(2124, "push constant block at b" +
+                              std::to_string(fact.Register) + " space" +
+                              std::to_string(fact.RegisterSpace) +
+                              " is not declared as RootConstants by the policy");
+      continue;
+    }
+    if (fact.Size > parameter->Num32BitValues * 4u)
+      AddDiagnostic(2124, "push constant block at b" +
+                              std::to_string(fact.Register) + " space" +
+                              std::to_string(fact.RegisterSpace) +
+                              " is larger than the RootConstants the policy "
+                              "declares");
   }
 
-  const auto hasDuplicateStaticSampler = [&]() noexcept {
-    for (size_t left = 0; left < rootBindings.size(); ++left)
-      for (size_t right = left + 1; right < rootBindings.size(); ++right)
-        if (rootBindings[left].RegisterClass == 3u &&
-            rootBindings[left].RegisterClass == rootBindings[right].RegisterClass &&
-            rootBindings[left].Group == rootBindings[right].Group &&
-            rootBindings[left].Binding == rootBindings[right].Binding)
-          return true;
-    return false;
-  };
-  if (hasDuplicateStaticSampler())
-    diagnostics.push_back({2104, "DXIL RootSignature contains duplicate static sampler"});
+  // Root constants come from the policy, not from liveness, so both lanes
+  // publish the same records for a given stage. A parameter no declaration
+  // matches has no push handle and is skipped.
+  for (const MetadataPolicyParameter &parameter : _policy) {
+    if (parameter.Kind !=
+            static_cast<uint32_t>(MetadataPolicyKind::RootConstants) ||
+        (parameter.StageMask & stageBit) == 0u)
+      continue;
+    const MetadataDeclarationFact *declaration = nullptr;
+    for (const MetadataDeclarationFact &candidate : _declarations)
+      if (candidate.HasRegister &&
+          candidate.RegisterSpace == parameter.RegisterSpace &&
+          candidate.RegisterNumber == parameter.BaseRegister &&
+          candidate.Kind == static_cast<uint32_t>(MetadataBindingKind::CBuffer))
+        declaration = &candidate;
+    if (declaration == nullptr)
+      continue;
+    if (_target != RadRayDxcTarget::DXIL && !declaration->HasVkPushConstant) {
+      AddDiagnostic(2124, "'" + declaration->Name +
+                              "' is root constants in the policy, so it needs "
+                              "[[vk::push_constant]] to lower the same way on "
+                              "both targets");
+      continue;
+    }
+    MetadataRootConstantFact fact;
+    fact.Name = declaration->Name;
+    fact.RegisterSpace = parameter.RegisterSpace;
+    fact.Register = parameter.BaseRegister;
+    fact.Offset = 0u;
+    fact.Size = parameter.Num32BitValues * 4u;
+    fact.StageMask = stageBit;
+    fact.Flags = 0u;
+    _metadata.RootConstants.push_back(std::move(fact));
+  }
 }
 
 void RadRayContractCollector::CollectDxilModule(llvm::Module &module) {
@@ -1609,10 +2237,14 @@ void RadRayContractCollector::CollectDxilModule(llvm::Module &module) {
                               "' has no assigned register");
     return false;
   };
+  const auto addResource = [&](const hlsl::DxilResourceBase &resource) {
+    AddDxilResourceFact(resource, FindDeclaration(resource.GetGlobalName()),
+                        _metadata, _stage, _diagnostics);
+  };
   for (const auto &resource : dxil.GetCBuffers()) {
     if (!requireExplicitBinding(*resource))
       continue;
-    AddDxilResourceFact(*resource, _metadata, _stage);
+    addResource(*resource);
     const llvm::Type *resourceType = resource->GetHLSLType();
     if (resourceType != nullptr && resourceType->isPointerTy())
       resourceType = resourceType->getPointerElementType();
@@ -1626,13 +2258,13 @@ void RadRayContractCollector::CollectDxilModule(llvm::Module &module) {
   }
   for (const auto &resource : dxil.GetSamplers())
     if (requireExplicitBinding(*resource))
-      AddDxilResourceFact(*resource, _metadata, _stage);
+      addResource(*resource);
   for (const auto &resource : dxil.GetSRVs())
     if (requireExplicitBinding(*resource))
-      AddDxilResourceFact(*resource, _metadata, _stage);
+      addResource(*resource);
   for (const auto &resource : dxil.GetUAVs())
     if (requireExplicitBinding(*resource))
-      AddDxilResourceFact(*resource, _metadata, _stage);
+      addResource(*resource);
 
   if (_stage == ShaderStage::Vertex) {
     const hlsl::DxilSignature &input = dxil.GetInputSignature();
@@ -1666,21 +2298,20 @@ void RadRayContractCollector::CollectDxilModule(llvm::Module &module) {
     }
   }
 
+  // The frontend already parsed the policy off the AST. Codegen serializes the
+  // same attribute independently, so requiring the two blobs to match is what
+  // makes the AST-side policy trustworthy for the SPIR-V lane as well.
   const vector<uint8_t> &serializedRoot = dxil.GetSerializedRootSignature();
-  if (serializedRoot.empty())
-    return;
-  _metadata.HasRootSignature = true;
-  _metadata.RootSignatureHash = Digest(serializedRoot, 0x52534947ull);
-  const hlsl::DxilVersionedRootSignatureDesc *root = nullptr;
-  hlsl::DeserializeRootSignature(serializedRoot.data(),
-                                 static_cast<uint32_t>(serializedRoot.size()),
-                                 &root);
-  if (root == nullptr) {
-    _diagnostics.push_back({2106, "DXIL RootSignature could not be decoded"});
-    return;
+  if (!serializedRoot.empty()) {
+    if (_hasRootSignature) {
+      if (serializedRoot != _rootSignatureBytes)
+        AddDiagnostic(2106, "DXIL RootSignature does not match the "
+                            "[RootSignature] the frontend parsed");
+    } else if (!_hasRootSignatureSource) {
+      AddDiagnostic(2106, "DXIL emitted a RootSignature the frontend never saw");
+    }
   }
-  ValidateDxilRootSignature(*root, _metadata, _stage, _diagnostics);
-  hlsl::DeleteRootSignature(root);
+  ApplyRootSignaturePolicy();
 }
 
 #ifdef ENABLE_SPIRV_CODEGEN
@@ -1903,6 +2534,35 @@ void RadRayContractCollector::CollectSpirvVertexInputs(
   }
 }
 
+// Coarse family of a logical kind. A structured and a raw buffer lower to the
+// same SPIR-V storage buffer, so the declaration decides between them and the
+// lowered shape only has to agree on the family.
+uint32_t MetadataKindFamily(MetadataBindingKind kind) noexcept {
+  switch (kind) {
+  case MetadataBindingKind::CBuffer:
+    return 1;
+  case MetadataBindingKind::TypedBuffer:
+    return 2;
+  case MetadataBindingKind::RWTypedBuffer:
+    return 3;
+  case MetadataBindingKind::StructuredBuffer:
+  case MetadataBindingKind::RawBuffer:
+    return 4;
+  case MetadataBindingKind::RWStructuredBuffer:
+  case MetadataBindingKind::RWRawBuffer:
+    return 5;
+  case MetadataBindingKind::Texture:
+    return 6;
+  case MetadataBindingKind::RWTexture:
+    return 7;
+  case MetadataBindingKind::Sampler:
+    return 8;
+  case MetadataBindingKind::Unknown:
+    break;
+  }
+  return 0;
+}
+
 void RadRayContractCollector::CollectSpirvAction(
     clang::EmitSpirvAction &action, string_view entryPointName) {
   clang::spirv::SpirvEmitter *emitter = action.getSpirvEmitter();
@@ -1949,10 +2609,24 @@ void RadRayContractCollector::CollectSpirvAction(
             activeResources.end())
       continue;
     const uint32_t stageMask = MetadataStageBitFor(_stage);
+    const string variableName = variable->getDebugName().str();
+    const MetadataDeclarationFact *declaration = FindDeclaration(variableName);
     if (pushConstant) {
       const uint32_t size = SpirvTypeSize(valueType);
-      if (!_sawPushConstant) {
-        _metadata.RootConstants.push_back({0u, 0u, 0u, size, stageMask, 1u});
+      if (declaration == nullptr || !declaration->HasRegister) {
+        AddDiagnostic(2120, "push constant block '" + variableName +
+                                "' needs a register() annotation to be placed "
+                                "on both targets");
+      } else if (!_sawPushConstant) {
+        MetadataRootConstantFact fact;
+        fact.Name = declaration->Name;
+        fact.RegisterSpace = declaration->RegisterSpace;
+        fact.Register = declaration->RegisterNumber;
+        fact.Offset = 0u;
+        fact.Size = size;
+        fact.StageMask = stageMask;
+        fact.Flags = 1u;
+        _metadata.RootConstants.push_back(std::move(fact));
         _sawPushConstant = true;
       } else {
         _diagnostics.push_back(
@@ -1964,35 +2638,57 @@ void RadRayContractCollector::CollectSpirvAction(
       continue;
     }
 
-    MetadataBindingKind bindingKind{};
+    // The logical kind comes from the declaration; the SPIR-V shape is only the
+    // cross-check that the lowering landed in the same family.
+    MetadataBindingKind lowered = MetadataBindingKind::Unknown;
     bool isBinding = variable->hasBinding();
     if (clang::spirv::SpirvType::isSampler(valueType))
-      bindingKind = MetadataBindingKind::Sampler;
+      lowered = MetadataBindingKind::Sampler;
     else if (clang::spirv::SpirvType::isRWTexture(valueType))
-      bindingKind = MetadataBindingKind::RWTexture;
+      lowered = MetadataBindingKind::RWTexture;
     else if (clang::spirv::SpirvType::isTexture(valueType))
-      bindingKind = MetadataBindingKind::Texture;
+      lowered = MetadataBindingKind::Texture;
     else if (clang::spirv::SpirvType::isRWBuffer(valueType))
-      bindingKind = MetadataBindingKind::RWBuffer;
+      lowered = MetadataBindingKind::RWTypedBuffer;
     else if (clang::spirv::SpirvType::isBuffer(valueType))
-      bindingKind = MetadataBindingKind::Buffer;
+      lowered = MetadataBindingKind::TypedBuffer;
     else if (llvm::isa<clang::spirv::StructType>(valueType)) {
       const auto *structure = llvm::cast<clang::spirv::StructType>(valueType);
       if (structure->getInterfaceType() ==
               clang::spirv::StructInterfaceType::StorageBuffer &&
           (variable->getStorageClass() == spv::StorageClass::Uniform ||
            variable->getStorageClass() == spv::StorageClass::StorageBuffer))
-        bindingKind = structure->isReadOnly() ? MetadataBindingKind::Buffer
-                                              : MetadataBindingKind::RWBuffer;
+        lowered = structure->isReadOnly()
+                      ? MetadataBindingKind::StructuredBuffer
+                      : MetadataBindingKind::RWStructuredBuffer;
       else if (structure->getInterfaceType() ==
                    clang::spirv::StructInterfaceType::UniformBuffer &&
                variable->getStorageClass() == spv::StorageClass::Uniform)
-        bindingKind = MetadataBindingKind::CBuffer;
+        lowered = MetadataBindingKind::CBuffer;
+      else
+        isBinding = false;
     }
     else
       isBinding = false;
     if (!isBinding)
       continue;
+    const MetadataBindingKind bindingKind =
+        declaration != nullptr
+            ? static_cast<MetadataBindingKind>(declaration->Kind)
+            : lowered;
+    if (bindingKind == MetadataBindingKind::Unknown) {
+      AddDiagnostic(2118, "resource '" + variableName +
+                              "' has a declaration type outside the RadRay "
+                              "shader contract");
+      continue;
+    }
+    if (lowered != MetadataBindingKind::Unknown &&
+        MetadataKindFamily(lowered) != MetadataKindFamily(bindingKind)) {
+      AddDiagnostic(2119, "resource '" + variableName +
+                              "' logical kind disagrees with its SPIR-V "
+                              "lowering");
+      continue;
+    }
     // DXC assigns a set/binding pair either way, so the authored attribute on
     // the ResourceVar is the only place an implicit assignment is still
     // distinguishable from a declared one. register() alone is not accepted: DXC
@@ -2008,8 +2704,7 @@ void RadRayContractCollector::CollectSpirvAction(
         });
     if (resourceVar == resourceVars.end() ||
         resourceVar->getBinding() == nullptr) {
-      AddDiagnostic(2113, "SPIR-V resource '" +
-                              variable->getDebugName().str() +
+      AddDiagnostic(2113, "SPIR-V resource '" + variableName +
                               "' is missing an explicit [[vk::binding]] binding");
       continue;
     }
@@ -2017,27 +2712,23 @@ void RadRayContractCollector::CollectSpirvAction(
     const int32_t binding = variable->getBindingNo();
     if (group < 0 || binding < 0)
       continue;
-    MetadataBindingFact *fact = AddMetadataBinding(
-        _metadata, variable->getDebugName().str(),
-        static_cast<uint32_t>(group), static_cast<uint32_t>(binding),
-        bindingKind, count, _stage);
-    // Keep the authored DXIL register so the merge step can associate the
-    // RootSignature's immutable sampler policy across stages.
-    const hlsl::RegisterAssignment *assignment = resourceVar->getRegister();
-    if (fact != nullptr && assignment != nullptr &&
-        assignment->RegisterType != 0) {
-      fact->HasDxilRegister = true;
-      fact->DxilRegisterNumber = assignment->RegisterNumber;
-      fact->DxilRegisterSpace = assignment->RegisterSpace.hasValue()
-                                    ? assignment->RegisterSpace.getValue()
-                                    : 0u;
-    }
+    // Group/Binding are the Vulkan set and binding here. The policy is written
+    // in D3D register terms, so its lookup goes through the declaration table
+    // rather than through these numbers.
+    const uint32_t declarationCount =
+        declaration != nullptr && declaration->Count != 0 ? declaration->Count
+                                                        : count;
+    AddMetadataBinding(_metadata, variableName, static_cast<uint32_t>(group),
+                       static_cast<uint32_t>(binding), bindingKind,
+                       declarationCount, _stage);
     if (bindingKind == MetadataBindingKind::CBuffer) {
       const auto *structure =
           llvm::dyn_cast<clang::spirv::StructType>(valueType);
       CollectSpirvStructFacts(structure, _metadata);
     }
   }
+
+  ApplyRootSignaturePolicy();
 
   if (_stage == ShaderStage::Vertex)
     CollectSpirvVertexInputs(*emitter);
@@ -2207,6 +2898,11 @@ bool CollectContractWithFrontend(
     argumentStorage.emplace_back(L"-all_resources_bound");
   if (request.WarningPolicy != 0)
     argumentStorage.emplace_back(L"-WX");
+  if (target == RadRayDxcTarget::DXIL) {
+    // Discovery parses the same source as the stage compiles, so it has to
+    // tolerate the [[vk::*]] authorization attributes this lane ignores.
+    argumentStorage.emplace_back(L"-Wno-ignored-attributes");
+  }
   if (target == RadRayDxcTarget::SPIRV) {
     argumentStorage.emplace_back(L"-spirv");
     argumentStorage.emplace_back(L"-fspv-target-env=vulkan1.2");
@@ -2277,72 +2973,6 @@ struct StageOutput {
   MetadataFacts Facts;
 };
 
-// Auxiliary DXIL analysis feeding the SPIR-V lane's immutable-sampler
-// association. Fails closed: any analysis error is a lane failure, while a
-// shader without an explicit RootSignature succeeds with
-// facts.HasRootSignature == false.
-bool CollectDxilRootPolicyForSpirv(const CompileRequest &request,
-                                   const EntryPoint &entry, IDxcUtils *utils,
-                                   IDxcIncludeHandler *includeHandler,
-                                   const vector<wstring> &spirvArguments,
-                                   MetadataFacts &facts,
-                                   vector<Diagnostic> &diagnostics) {
-  vector<wstring> argumentStorage;
-  argumentStorage.reserve(spirvArguments.size());
-  for (const wstring &argument : spirvArguments) {
-    if (argument == L"-spirv" ||
-        argument == L"-fspv-target-env=vulkan1.2")
-      continue;
-    argumentStorage.push_back(argument);
-  }
-  vector<LPCWSTR> arguments;
-  arguments.reserve(argumentStorage.size());
-  for (const wstring &argument : argumentStorage)
-    arguments.push_back(argument.c_str());
-
-  wstring sourceName;
-  wstring entryName;
-  if (!ToWide(request.SourceName, sourceName) ||
-      !ToWide(entry.Name, entryName)) {
-    diagnostics.push_back({2000, "source or entry name is not valid UTF-8"});
-    return false;
-  }
-  const wstring probeProfile = ProfileForStage(entry.Stage, request.ShaderModel);
-  CComPtr<IDxcCompilerArgs> compilerArgs;
-  if (FAILED(utils->BuildArguments(
-          sourceName.c_str(), entryName.c_str(), probeProfile.c_str(),
-          arguments.data(), static_cast<uint32_t>(arguments.size()), nullptr, 0,
-          &compilerArgs))) {
-    diagnostics.push_back(
-        {2003,
-         "fork DXC argument construction failed for the DXIL root policy analysis"});
-    return false;
-  }
-
-  DxcBuffer source{};
-  source.Ptr = request.RootSource.data();
-  source.Size = request.RootSource.size();
-  source.Encoding = DXC_CP_UTF8;
-  RadRayFrontendObserver observer(request.SourceName, RadRayDxcTarget::DXIL,
-                                   entry.Stage);
-  CComPtr<IDxcResult> result;
-  if (FAILED(CompileDxcWithRadRayObserver(
-          &source, compilerArgs->GetArguments(), compilerArgs->GetCount(),
-          includeHandler, &observer, IID_PPV_ARGS(&result)))) {
-    diagnostics.push_back(
-        {2003, "fork DXC DXIL root policy analysis call failed"});
-    return false;
-  }
-  if (!CheckDxcResult(result, 2110,
-                      "DXIL root policy analysis for the SPIR-V lane failed",
-                      diagnostics))
-    return false;
-  if (!observer.AppendDiagnostics(diagnostics))
-    return false;
-  facts = observer.Metadata();
-  return true;
-}
-
 bool CompileStage(const CompileRequest &request, RadRayDxcTarget target,
                   const EntryPoint &entry,
                   RadRayDxcIncludePathListView includePaths,
@@ -2367,8 +2997,13 @@ bool CompileStage(const CompileRequest &request, RadRayDxcTarget target,
     argumentStorage.emplace_back(L"-all_resources_bound");
   if (request.WarningPolicy != 0)
     argumentStorage.emplace_back(L"-WX");
-  if (target == RadRayDxcTarget::DXIL)
+  if (target == RadRayDxcTarget::DXIL) {
     argumentStorage.emplace_back(L"-Qstrip_rootsignature");
+    // A push block is authorized with [[vk::push_constant]], which this lane
+    // ignores by design. Without this the warning becomes an error under -WX and
+    // the same source could not compile for both targets.
+    argumentStorage.emplace_back(L"-Wno-ignored-attributes");
+  }
   if (target == RadRayDxcTarget::SPIRV) {
     argumentStorage.emplace_back(L"-spirv");
     argumentStorage.emplace_back(L"-fspv-target-env=vulkan1.2");
@@ -2459,44 +3094,44 @@ bool CompileStage(const CompileRequest &request, RadRayDxcTarget target,
       output.RootSignature.assign(
           rootData, rootData + rootSignature->GetBufferSize());
     }
+    // The frontend parsed the policy off the AST and already compared its
+    // serialized form against the module's copy. This is the container-level
+    // witness of the same invariant: the emitted container has to wrap exactly
+    // the bytes the frontend produced.
     if (output.Facts.HasRootSignature != !output.RootSignature.empty()) {
       diagnostics.push_back({
           2106,
           "DXIL RootSignature observer state does not match DXC output"});
       return false;
     }
-    output.Facts.SerializedRootSignature = output.RootSignature;
-  }
-  if (target == RadRayDxcTarget::SPIRV) {
-    MetadataFacts dxilRootPolicy;
-    if (!CollectDxilRootPolicyForSpirv(request, entry, utils.p,
-                                       includeHandler.p, argumentStorage,
-                                       dxilRootPolicy, diagnostics))
-      return false;
-    if (dxilRootPolicy.HasRootSignature) {
-      output.Facts.HasDxilRootPolicy = true;
-      output.Facts.DxilRootPolicyHash = dxilRootPolicy.RootSignatureHash;
-    }
-    if (dxilRootPolicy.HasRootSignature &&
-        dxilRootPolicy.HasStaticSamplerPolicy) {
-      // Carry the policy's register slots forward; the flag itself is applied
-      // in MergeMetadataFacts, where every stage's probe has been unioned. The
-      // stage declaring the RootSignature is often not the stage where a given
-      // sampler is live, so a per-stage decision here would drop the flag.
-      output.Facts.HasStaticSamplerPolicy = true;
-      for (const MetadataRootBindingFact &staticSampler :
-           dxilRootPolicy.StaticSamplerBindings) {
-        const auto found = std::find_if(
-            output.Facts.StaticSamplerBindings.begin(),
-            output.Facts.StaticSamplerBindings.end(),
-            [&](const MetadataRootBindingFact &value) noexcept {
-              return value.RegisterClass == staticSampler.RegisterClass &&
-                     value.Group == staticSampler.Group &&
-                     value.Binding == staticSampler.Binding;
-            });
-        if (found == output.Facts.StaticSamplerBindings.end())
-          output.Facts.StaticSamplerBindings.push_back(staticSampler);
+    if (output.Facts.HasRootSignature) {
+      const hlsl::DxilContainerHeader *container = hlsl::IsDxilContainerLike(
+          output.RootSignature.data(), output.RootSignature.size());
+      const hlsl::DxilPartHeader *part =
+          container != nullptr &&
+                  hlsl::IsValidDxilContainer(container,
+                                             output.RootSignature.size())
+              ? hlsl::GetDxilPartByType(container, hlsl::DFCC_RootSignature)
+              : nullptr;
+      if (part == nullptr) {
+        diagnostics.push_back({
+            2106,
+            "DXIL RootSignature output is not a container with a policy part"});
+        return false;
       }
+      const auto *partData =
+          reinterpret_cast<const uint8_t *>(hlsl::GetDxilPartData(part));
+      if (part->PartSize != output.Facts.SerializedRootSignature.size() ||
+          std::memcmp(partData, output.Facts.SerializedRootSignature.data(),
+                      part->PartSize) != 0) {
+        diagnostics.push_back({
+            2106,
+            "DXIL RootSignature container does not match the frontend's policy"});
+        return false;
+      }
+      // The container is what the wire carries on this target; the hash keeps
+      // identifying the policy, not the container that wraps it.
+      output.Facts.SerializedRootSignature = output.RootSignature;
     }
   }
   return true;
@@ -2521,12 +3156,17 @@ struct WireEnvelope {
   WireRange TypeRecords;
   WireRange RootConstantRecords;
   WireRange VertexInputRecords;
+  // Immutable sampler states in policy order, referenced by
+  // WireBindingRecord::SamplerIndex. Vulkan only.
+  WireRange SamplerRecords;
   WireRange RootSignature;
   WireRange Bytecode;
   uint64_t ToolchainIdentity;
   uint8_t Contract[16];
   uint8_t BytecodeDigest[16];
-  uint8_t PipelineLayoutDigest[16];
+  // Digest of the target-independent layout the compiler published. The
+  // resolved, target-typed layout is derived from it and digested separately.
+  uint8_t BasePipelineLayoutDigest[16];
   uint8_t GpuArtifact[16];
 };
 
@@ -2547,6 +3187,12 @@ struct WireBindingRecord {
   uint32_t Type;
   uint32_t Count;
   uint32_t StageMask;
+  // Where the policy puts this binding: a descriptor table, a root descriptor
+  // bound by address, or a D3D static sampler slot that owns no table entry.
+  uint32_t Placement;
+  // Index into SamplerRecords, or 0xffffffff when the binding is not an
+  // immutable sampler.
+  uint32_t SamplerIndex;
   uint32_t Flags;
 };
 
@@ -2563,11 +3209,34 @@ struct WireTypeRecord {
 };
 
 struct WireRootConstantRecord {
+  // Declaration name of the push block. The push handle table is keyed on it.
+  WireRange Name;
   uint32_t RegisterSpace;
   uint32_t Register;
   uint32_t Offset;
   uint32_t Size;
   uint32_t StageMask;
+  uint32_t Flags;
+};
+
+// A static sampler state in Vulkan terms. Every field holds the official Vulkan
+// enumerant value, so the backend consumes it without a second mapping table.
+struct WireSamplerRecord {
+  uint32_t MagFilter;
+  uint32_t MinFilter;
+  uint32_t MipmapMode;
+  uint32_t AddressModeU;
+  uint32_t AddressModeV;
+  uint32_t AddressModeW;
+  float MipLodBias;
+  uint32_t AnisotropyEnable;
+  float MaxAnisotropy;
+  uint32_t CompareEnable;
+  uint32_t CompareOp;
+  float MinLod;
+  float MaxLod;
+  uint32_t BorderColor;
+  uint32_t ReductionMode;
   uint32_t Flags;
 };
 
@@ -2581,11 +3250,12 @@ struct WireVertexInputRecord {
 };
 #pragma pack(pop)
 
-static_assert(sizeof(WireEnvelope) == 144);
+static_assert(sizeof(WireEnvelope) == 152);
 static_assert(sizeof(WireEntryRecord) == 24);
-static_assert(sizeof(WireBindingRecord) == 32);
+static_assert(sizeof(WireBindingRecord) == 40);
 static_assert(sizeof(WireTypeRecord) == 40);
-static_assert(sizeof(WireRootConstantRecord) == 24);
+static_assert(sizeof(WireRootConstantRecord) == 32);
+static_assert(sizeof(WireSamplerRecord) == 64);
 static_assert(sizeof(WireVertexInputRecord) == 28);
 
 // Stages only report the struct types reachable from their own live resources
@@ -2661,59 +3331,45 @@ bool MergeMetadataFacts(const ContractData &contract,
                         const vector<StageOutput> &stages,
                         MetadataFacts &facts,
                         vector<Diagnostic> &diagnostics) {
+  (void)contract;
   facts = {};
   for (const StageOutput &stage : stages) {
     const MetadataFacts &source = stage.Facts;
-    if (source.HasDxilRootPolicy) {
-      if (facts.HasDxilRootPolicy &&
-          !(facts.DxilRootPolicyHash == source.DxilRootPolicyHash)) {
-        diagnostics.push_back(
-            {2105, "graphics stages declare different RootSignature attributes"});
-        return false;
-      }
-      facts.HasDxilRootPolicy = true;
-      facts.DxilRootPolicyHash = source.DxilRootPolicyHash;
-    }
-    if (source.HasStaticSamplerPolicy)
-      facts.HasStaticSamplerPolicy = true;
-    for (const MetadataRootBindingFact &staticSampler : source.StaticSamplerBindings) {
-      const auto found = std::find_if(
-          facts.StaticSamplerBindings.begin(), facts.StaticSamplerBindings.end(),
-          [&](const MetadataRootBindingFact &value) noexcept {
-            return value.RegisterClass == staticSampler.RegisterClass &&
-                   value.Group == staticSampler.Group &&
-                   value.Binding == staticSampler.Binding;
-          });
-      if (found == facts.StaticSamplerBindings.end())
-        facts.StaticSamplerBindings.push_back(staticSampler);
-    }
+    // The policy is a translation-unit fact, so a stage that saw one must have
+    // seen the same one, down to the serialized bytes and the sampler table.
     if (source.HasRootSignature) {
-      if (source.SerializedRootSignature.empty()) {
-        diagnostics.push_back({
-            2106, "DXIL RootSignature metadata has no serialized output"});
+      // Only D3D ships the serialized carrier; Vulkan describes the same policy
+      // through placements and sampler records.
+      if (target == RadRayDxcTarget::DXIL &&
+          source.SerializedRootSignature.empty()) {
+        diagnostics.push_back(
+            {2106, "RootSignature metadata has no serialized output"});
         return false;
       }
-      if (facts.HasRootSignature &&
-          facts.SerializedRootSignature != source.SerializedRootSignature) {
-        diagnostics.push_back(
-            {2105, "graphics stages declare different RootSignature attributes"});
-        return false;
+      if (facts.HasRootSignature) {
+        if (!(facts.RootSignatureHash == source.RootSignatureHash) ||
+            facts.SerializedRootSignature != source.SerializedRootSignature) {
+          diagnostics.push_back(
+              {2105,
+               "stages disagree on the [RootSignature] policy they declare"});
+          return false;
+        }
+        if (facts.Samplers.size() != source.Samplers.size()) {
+          diagnostics.push_back(
+              {2105, "stages disagree on the policy's static sampler table"});
+          return false;
+        }
+        for (size_t index = 0; index < facts.Samplers.size(); ++index)
+          if (!SameSamplerFact(facts.Samplers[index], source.Samplers[index])) {
+            diagnostics.push_back(
+                {2105, "stages disagree on the policy's static sampler table"});
+            return false;
+          }
       }
       facts.HasRootSignature = true;
       facts.RootSignatureHash = source.RootSignatureHash;
       facts.SerializedRootSignature = source.SerializedRootSignature;
-    }
-
-    for (const MetadataRootBindingFact &rootBinding : source.RootBindings) {
-      const auto found = std::find_if(
-          facts.RootBindings.begin(), facts.RootBindings.end(),
-          [&](const MetadataRootBindingFact &value) noexcept {
-            return value.RegisterClass == rootBinding.RegisterClass &&
-                   value.Group == rootBinding.Group &&
-                   value.Binding == rootBinding.Binding;
-          });
-      if (found == facts.RootBindings.end())
-        facts.RootBindings.push_back(rootBinding);
+      facts.Samplers = source.Samplers;
     }
 
     for (const MetadataBindingFact &binding : source.Bindings) {
@@ -2724,21 +3380,19 @@ bool MergeMetadataFacts(const ContractData &contract,
           });
       if (found == facts.Bindings.end()) {
         facts.Bindings.push_back(binding);
-      } else if (found->Group != binding.Group ||
-                 found->Binding != binding.Binding ||
-                 found->RegisterClass != binding.RegisterClass ||
-                 found->Type != binding.Type ||
-                 found->Count != binding.Count ||
-                 found->HasDxilRegister != binding.HasDxilRegister ||
-                 (found->HasDxilRegister &&
-                  (found->DxilRegisterSpace != binding.DxilRegisterSpace ||
-                   found->DxilRegisterNumber != binding.DxilRegisterNumber))) {
-        diagnostics.push_back({2109, "frontend stages disagree on a resource binding"});
-        return false;
-      } else {
-        found->StageMask |= binding.StageMask;
-        found->Flags |= binding.Flags;
+        continue;
       }
+      if (found->Group != binding.Group || found->Binding != binding.Binding ||
+          found->RegisterClass != binding.RegisterClass ||
+          found->Type != binding.Type || found->Count != binding.Count ||
+          found->Placement != binding.Placement ||
+          found->SamplerIndex != binding.SamplerIndex) {
+        diagnostics.push_back(
+            {2109, "frontend stages disagree on a resource binding"});
+        return false;
+      }
+      found->StageMask |= binding.StageMask;
+      found->Flags |= binding.Flags;
     }
 
     if (!MergeTypeFacts(facts.Types, source.Types, diagnostics))
@@ -2748,15 +3402,21 @@ bool MergeMetadataFacts(const ContractData &contract,
       const auto found = std::find_if(
           facts.RootConstants.begin(), facts.RootConstants.end(),
           [&](const MetadataRootConstantFact &value) noexcept {
-            return value.RegisterSpace == constant.RegisterSpace &&
-                   value.Register == constant.Register &&
-                   value.Offset == constant.Offset && value.Size == constant.Size &&
-                   value.Flags == constant.Flags;
+            return value.Name == constant.Name &&
+                   value.RegisterSpace == constant.RegisterSpace &&
+                   value.Register == constant.Register;
           });
-      if (found == facts.RootConstants.end())
+      if (found == facts.RootConstants.end()) {
         facts.RootConstants.push_back(constant);
-      else
-        found->StageMask |= constant.StageMask;
+        continue;
+      }
+      if (found->Offset != constant.Offset || found->Size != constant.Size ||
+          found->Flags != constant.Flags) {
+        diagnostics.push_back(
+            {2124, "frontend stages disagree on a push constant block"});
+        return false;
+      }
+      found->StageMask |= constant.StageMask;
     }
 
     for (const MetadataVertexInputFact &input : source.VertexInputs) {
@@ -2771,7 +3431,8 @@ bool MergeMetadataFacts(const ContractData &contract,
       else if (found->Location != input.Location ||
                found->ComponentType != input.ComponentType ||
                found->ComponentCount != input.ComponentCount) {
-        diagnostics.push_back({2108, "frontend stages disagree on vertex input metadata"});
+        diagnostics.push_back(
+            {2108, "frontend stages disagree on vertex input metadata"});
         return false;
       }
     }
@@ -2781,64 +3442,6 @@ bool MergeMetadataFacts(const ContractData &contract,
     diagnostics.push_back(
         {2103, "SPIR-V source contains multiple push constant blocks"});
     return false;
-  }
-  if (target == RadRayDxcTarget::SPIRV && facts.HasStaticSamplerPolicy) {
-    // Associate on the authored DXIL register, matched against the merged
-    // RootSignature policy. A per-stage name association cannot work: the stage
-    // declaring the RootSignature need not be the stage where the sampler is
-    // live, and each probe only sees its own stage's surviving resources.
-    for (MetadataBindingFact &binding : facts.Bindings) {
-      if (binding.Type !=
-              static_cast<uint32_t>(MetadataBindingKind::Sampler) ||
-          !binding.HasDxilRegister)
-        continue;
-      if (std::any_of(facts.StaticSamplerBindings.begin(),
-                      facts.StaticSamplerBindings.end(),
-                      [&](const MetadataRootBindingFact &rootBinding) noexcept {
-                        return rootBinding.RegisterClass == 3u &&
-                               rootBinding.Group == binding.DxilRegisterSpace &&
-                               rootBinding.Binding ==
-                                   binding.DxilRegisterNumber;
-                      }))
-        binding.Flags |= kMetadataImmutableSampler;
-    }
-  }
-  if (target == RadRayDxcTarget::DXIL && facts.HasRootSignature) {
-    const auto hasRootBinding = [](const MetadataRootBindingFact &rootBinding,
-                                   const MetadataBindingFact &binding,
-                                   uint32_t arrayElement = 0) noexcept {
-      return rootBinding.RegisterClass == binding.RegisterClass &&
-             rootBinding.Group == binding.Group &&
-             arrayElement <= std::numeric_limits<uint32_t>::max() - binding.Binding &&
-             rootBinding.Binding == binding.Binding + arrayElement;
-    };
-    for (const MetadataBindingFact &binding : facts.Bindings) {
-      if (binding.Count == 0 || binding.Count > kMaxCollectionCount) {
-        diagnostics.push_back(
-            {2106, "DXIL RootSignature active resource array is unsupported"});
-        return false;
-      }
-      for (uint32_t arrayElement = 0; arrayElement < binding.Count; ++arrayElement) {
-        const auto found = std::find_if(
-            facts.RootBindings.begin(), facts.RootBindings.end(),
-            [&](const MetadataRootBindingFact &rootBinding) noexcept {
-              return hasRootBinding(rootBinding, binding, arrayElement);
-            });
-        if (found == facts.RootBindings.end()) {
-          diagnostics.push_back(
-              {2106, "DXIL RootSignature does not contain an active resource"});
-          return false;
-        }
-      }
-    }
-    for (MetadataBindingFact &binding : facts.Bindings)
-      if (binding.Type == static_cast<uint32_t>(MetadataBindingKind::Sampler) &&
-          std::any_of(facts.StaticSamplerBindings.begin(),
-                      facts.StaticSamplerBindings.end(),
-                      [&](const MetadataRootBindingFact &rootBinding) noexcept {
-                        return hasRootBinding(rootBinding, binding);
-                      }))
-        binding.Flags |= kMetadataImmutableSampler;
   }
   for (MetadataRootConstantFact &constant : facts.RootConstants)
     constant.StageMask &= 0x7u;
@@ -2867,7 +3470,10 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
   const uint32_t vertexInputOffset = rootConstantOffset + rootConstantBytes;
   const uint32_t vertexInputBytes = static_cast<uint32_t>(
       facts.VertexInputs.size() * sizeof(WireVertexInputRecord));
-  const uint32_t nameOffset = vertexInputOffset + vertexInputBytes;
+  const uint32_t samplerOffset = vertexInputOffset + vertexInputBytes;
+  const uint32_t samplerBytes = static_cast<uint32_t>(
+      facts.Samplers.size() * sizeof(WireSamplerRecord));
+  const uint32_t nameOffset = samplerOffset + samplerBytes;
   uint32_t nameBytes = 0;
   for (const EntryPoint &entry : contract.EntryPoints)
     nameBytes += static_cast<uint32_t>(entry.Name.size());
@@ -2875,6 +3481,8 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
     nameBytes += static_cast<uint32_t>(binding.Name.size());
   for (const MetadataTypeFact &type : facts.Types)
     nameBytes += static_cast<uint32_t>(type.Name.size());
+  for (const MetadataRootConstantFact &constant : facts.RootConstants)
+    nameBytes += static_cast<uint32_t>(constant.Name.size());
   for (const MetadataVertexInputFact &input : facts.VertexInputs)
     nameBytes += static_cast<uint32_t>(input.Semantic.size());
   const uint32_t rootSignatureOffset = nameOffset + nameBytes;
@@ -2896,6 +3504,7 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
   envelope.TypeRecords = {typeOffset, typeBytes};
   envelope.RootConstantRecords = {rootConstantOffset, rootConstantBytes};
   envelope.VertexInputRecords = {vertexInputOffset, vertexInputBytes};
+  envelope.SamplerRecords = {samplerOffset, samplerBytes};
   envelope.RootSignature = {rootSignatureOffset, rootSignatureSize};
   envelope.Bytecode = {bytecodeOffset, bytecodeSize};
   envelope.ToolchainIdentity = kMetadataToolchainIdentity;
@@ -2928,6 +3537,8 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
     record.Type = fact.Type;
     record.Count = fact.Count;
     record.StageMask = fact.StageMask;
+    record.Placement = fact.Placement;
+    record.SamplerIndex = fact.SamplerIndex;
     record.Flags = fact.Flags;
     bindings.push_back(record);
     currentNameOffset += static_cast<uint32_t>(fact.Name.size());
@@ -2952,9 +3563,18 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
 
   vector<WireRootConstantRecord> rootConstants;
   rootConstants.reserve(facts.RootConstants.size());
-  for (const MetadataRootConstantFact &fact : facts.RootConstants)
-    rootConstants.push_back({fact.RegisterSpace, fact.Register, fact.Offset,
-                             fact.Size, fact.StageMask, fact.Flags});
+  for (const MetadataRootConstantFact &fact : facts.RootConstants) {
+    WireRootConstantRecord record{};
+    record.Name = {currentNameOffset, static_cast<uint32_t>(fact.Name.size())};
+    record.RegisterSpace = fact.RegisterSpace;
+    record.Register = fact.Register;
+    record.Offset = fact.Offset;
+    record.Size = fact.Size;
+    record.StageMask = fact.StageMask;
+    record.Flags = fact.Flags;
+    rootConstants.push_back(record);
+    currentNameOffset += static_cast<uint32_t>(fact.Name.size());
+  }
 
   vector<WireVertexInputRecord> vertexInputs;
   vertexInputs.reserve(facts.VertexInputs.size());
@@ -2969,6 +3589,29 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
     record.Flags = fact.Flags;
     vertexInputs.push_back(record);
     currentNameOffset += static_cast<uint32_t>(fact.Semantic.size());
+  }
+
+  vector<WireSamplerRecord> samplers;
+  samplers.reserve(facts.Samplers.size());
+  for (const MetadataSamplerFact &fact : facts.Samplers) {
+    WireSamplerRecord record{};
+    record.MagFilter = fact.MagFilter;
+    record.MinFilter = fact.MinFilter;
+    record.MipmapMode = fact.MipmapMode;
+    record.AddressModeU = fact.AddressModeU;
+    record.AddressModeV = fact.AddressModeV;
+    record.AddressModeW = fact.AddressModeW;
+    record.MipLodBias = fact.MipLodBias;
+    record.AnisotropyEnable = fact.AnisotropyEnable;
+    record.MaxAnisotropy = fact.MaxAnisotropy;
+    record.CompareEnable = fact.CompareEnable;
+    record.CompareOp = fact.CompareOp;
+    record.MinLod = fact.MinLod;
+    record.MaxLod = fact.MaxLod;
+    record.BorderColor = fact.BorderColor;
+    record.ReductionMode = fact.ReductionMode;
+    record.Flags = fact.Flags;
+    samplers.push_back(record);
   }
 
   envelope.TotalSize = bytecodeOffset + bytecodeSize;
@@ -2990,12 +3633,19 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
     const auto *data = reinterpret_cast<const uint8_t *>(vertexInputs.data());
     layoutBytes.insert(layoutBytes.end(), data, data + vertexInputBytes);
   }
+  if (!samplers.empty()) {
+    const auto *data = reinterpret_cast<const uint8_t *>(samplers.data());
+    layoutBytes.insert(layoutBytes.end(), data, data + samplerBytes);
+  }
   for (const EntryPoint &entry : contract.EntryPoints)
     layoutBytes.insert(layoutBytes.end(), entry.Name.begin(), entry.Name.end());
   for (const MetadataBindingFact &binding : facts.Bindings)
     layoutBytes.insert(layoutBytes.end(), binding.Name.begin(), binding.Name.end());
   for (const MetadataTypeFact &type : facts.Types)
     layoutBytes.insert(layoutBytes.end(), type.Name.begin(), type.Name.end());
+  for (const MetadataRootConstantFact &constant : facts.RootConstants)
+    layoutBytes.insert(layoutBytes.end(), constant.Name.begin(),
+                       constant.Name.end());
   for (const MetadataVertexInputFact &input : facts.VertexInputs)
     layoutBytes.insert(layoutBytes.end(), input.Semantic.begin(), input.Semantic.end());
   const Hash128 bytecodeHash = [&]() {
@@ -3011,8 +3661,8 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
     AppendBytes(gpuInput, stage.Bytecode);
   const Hash128 gpuHash = Digest(gpuInput, 0x475055ull + envelope.Target);
   std::memcpy(envelope.BytecodeDigest, bytecodeHash.Bytes, sizeof(envelope.BytecodeDigest));
-  std::memcpy(envelope.PipelineLayoutDigest, pipelineHash.Bytes,
-              sizeof(envelope.PipelineLayoutDigest));
+  std::memcpy(envelope.BasePipelineLayoutDigest, pipelineHash.Bytes,
+              sizeof(envelope.BasePipelineLayoutDigest));
   std::memcpy(envelope.GpuArtifact, gpuHash.Bytes, sizeof(envelope.GpuArtifact));
 
   metadata.assign(envelope.TotalSize, 0);
@@ -3029,6 +3679,8 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
   if (!vertexInputs.empty())
     std::memcpy(metadata.data() + vertexInputOffset, vertexInputs.data(),
                 vertexInputBytes);
+  if (!samplers.empty())
+    std::memcpy(metadata.data() + samplerOffset, samplers.data(), samplerBytes);
   currentNameOffset = nameOffset;
   for (const EntryPoint &entry : contract.EntryPoints) {
     std::memcpy(metadata.data() + currentNameOffset, entry.Name.data(), entry.Name.size());
@@ -3043,6 +3695,11 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
     std::memcpy(metadata.data() + currentNameOffset, type.Name.data(),
                 type.Name.size());
     currentNameOffset += static_cast<uint32_t>(type.Name.size());
+  }
+  for (const MetadataRootConstantFact &constant : facts.RootConstants) {
+    std::memcpy(metadata.data() + currentNameOffset, constant.Name.data(),
+                constant.Name.size());
+    currentNameOffset += static_cast<uint32_t>(constant.Name.size());
   }
   for (const MetadataVertexInputFact &input : facts.VertexInputs) {
     std::memcpy(metadata.data() + currentNameOffset, input.Semantic.data(),
