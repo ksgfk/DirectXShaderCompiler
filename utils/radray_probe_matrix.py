@@ -215,13 +215,14 @@ def build_probe(build_dir, verbose):
             % (VCVARS, ROOT, PROBE_SOURCE,
                os.path.join(build_dir, "probe."), output, library))
     result = subprocess.run(["cmd", "/c", script], cwd=ROOT,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            universal_newlines=True)
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    # The toolchain localizes its diagnostics, so decode defensively.
+    log = result.stdout.decode("utf-8", errors="replace")
     if result.returncode != 0 or not os.path.exists(output):
-        sys.stderr.write(result.stdout)
+        sys.stderr.write(log)
         return None
     if verbose:
-        sys.stdout.write(result.stdout)
+        sys.stdout.write(log)
     return output
 
 
@@ -232,10 +233,18 @@ def check(name, probe, verbose):
         return ["missing fixture %s" % source]
     result = subprocess.run([probe, source, "60", str(mask)],
                             cwd=os.path.dirname(probe),
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            universal_newlines=True)
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    # A stale dxcompiler emits a different envelope layout, so the probe decodes
+    # garbage rather than text; never let that surface as a decode crash.
+    output = result.stdout.decode("utf-8", errors="replace")
     if verbose:
-        sys.stdout.write(result.stdout)
+        sys.stdout.write(output)
+    schema = re.search(r"schema=(\d+)", output)
+    if schema is not None and int(schema.group(1)) != 6:
+        return ["probe read schema %s, expected 6: the dxcompiler in this build "
+                "tree predates the contract, rebuild the dxcompiler target"
+                % schema.group(1)]
+    result.stdout = output
     failures = []
     if result.returncode != expected_code:
         failures.append("exit code %d, expected %d" % (result.returncode, expected_code))
@@ -250,7 +259,7 @@ def check(name, probe, verbose):
         if not any(needle in line for line in lines):
             failures.append("missing: %s" % needle)
     if failures and not verbose:
-        failures.append("--- probe output ---\n%s" % result.stdout.strip())
+        failures.append("--- probe output ---\n%s" % output.strip())
     return failures
 
 

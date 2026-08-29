@@ -510,6 +510,13 @@ struct MetadataBindingFact {
   // Index into MetadataFacts::Samplers. Only the SPIR-V lane fills it: a D3
   // static sampler stays inside the serialized RootSignature carrier.
   uint32_t SamplerIndex{kMetadataNoSampler};
+  // The declaration's D3 register, recorded on both lanes. It is not published on
+  // the wire; it exists so the cross-stage merge can reject a declaration whose
+  // register depends on the stage, which would make one name describe different
+  // resources on the two targets.
+  bool HasDeclarationRegister{false};
+  uint32_t DeclarationRegisterSpace{0};
+  uint32_t DeclarationRegisterNumber{0};
 };
 
 // Immutable sampler state in Vulkan semantics. The numeric values mirror the
@@ -2036,6 +2043,16 @@ const MetadataPolicyParameter *RadRayContractCollector::FindPolicyParameter(
 
 void RadRayContractCollector::ApplyRootSignaturePolicy() {
   const uint32_t stageBit = MetadataStageBitFor(_stage);
+  // Stamped before any policy work and on both lanes, so the cross-stage merge sees
+  // it whether or not a policy exists.
+  for (MetadataBindingFact &binding : _metadata.Bindings) {
+    const MetadataDeclarationFact *declaration = FindDeclaration(binding.Name);
+    if (declaration == nullptr || !declaration->HasRegister)
+      continue;
+    binding.HasDeclarationRegister = true;
+    binding.DeclarationRegisterSpace = declaration->RegisterSpace;
+    binding.DeclarationRegisterNumber = declaration->RegisterNumber;
+  }
   if (!_hasRootSignature) {
     // No policy: everything stays in a descriptor table and the lane's own
     // observations are published unchanged. Push blocks still gain their
@@ -3386,7 +3403,11 @@ bool MergeMetadataFacts(const ContractData &contract,
           found->RegisterClass != binding.RegisterClass ||
           found->Type != binding.Type || found->Count != binding.Count ||
           found->Placement != binding.Placement ||
-          found->SamplerIndex != binding.SamplerIndex) {
+          found->SamplerIndex != binding.SamplerIndex ||
+          found->HasDeclarationRegister != binding.HasDeclarationRegister ||
+          (binding.HasDeclarationRegister &&
+           (found->DeclarationRegisterSpace != binding.DeclarationRegisterSpace ||
+            found->DeclarationRegisterNumber != binding.DeclarationRegisterNumber))) {
         diagnostics.push_back(
             {2109, "frontend stages disagree on a resource binding"});
         return false;
