@@ -1,5 +1,5 @@
 // Standalone probe for the RadRay DXC extension. Drives DiscoverSourceContract
-// plus CompileVariant against a source file and prints the decoded schema 6 wire
+// plus CompileVariant against a source file and prints the decoded schema 7 wire
 // so the compiler-side contract can be verified without the RadRay tree.
 //
 // Build (from the fork root, with a VS developer prompt or -I to the SDK):
@@ -97,13 +97,39 @@ const char *PlacementName(uint32_t placement) {
     return "?";
   }
 }
+std::string PayloadName(const Wire &wire, uint32_t typeOffset,
+                        uint32_t typeBytes, uint32_t typeIndex) {
+  constexpr uint32_t kNoType = 0xffffffffu;
+  constexpr uint32_t kTypeStride = 40u;
+  if (typeIndex == kNoType)
+    return std::string("none");
+  if ((typeBytes % kTypeStride) != 0 ||
+      typeIndex >= typeBytes / kTypeStride)
+    return std::string("bad-index");
+  return wire.Text(typeOffset + typeIndex * kTypeStride);
+}
+
+bool SameLaneMetadata(IRadRayDxcResult *left, IRadRayDxcResult *right,
+                      RadRayDxcTarget target) {
+  RadRayDxcLaneView leftLane{};
+  RadRayDxcLaneView rightLane{};
+  const HRESULT leftStatus = left->GetTargetLane(target, &leftLane);
+  const HRESULT rightStatus = right->GetTargetLane(target, &rightLane);
+  if (SUCCEEDED(leftStatus) != SUCCEEDED(rightStatus))
+    return false;
+  if (FAILED(leftStatus))
+    return true;
+  return leftLane.Metadata.Size == rightLane.Metadata.Size &&
+         std::memcmp(leftLane.Metadata.Data, rightLane.Metadata.Data,
+                     leftLane.Metadata.Size) == 0;
+}
 
 void PrintLane(const char *label, RadRayDxcLaneView lane) {
   Wire wire{lane.Metadata.Data, lane.Metadata.Size};
   std::printf("\n=== %s lane: metadata %u bytes, bytecode %u bytes ===\n", label,
               lane.Metadata.Size, lane.Bytecode.Size);
   if (wire.Size < 152) {
-    std::printf("  metadata too small for a schema 6 envelope\n");
+    std::printf("  metadata too small for a schema 7 envelope\n");
     return;
   }
   std::printf("  schema=%u headerSize=%u total=%u target=%u stageMask=0x%x\n",
@@ -111,6 +137,8 @@ void PrintLane(const char *label, RadRayDxcLaneView lane) {
               wire.Data[13]);
   const uint32_t bindingOffset = wire.U32(24);
   const uint32_t bindingBytes = wire.U32(28);
+  const uint32_t typeOffset = wire.U32(32);
+  const uint32_t typeBytes = wire.U32(36);
   const uint32_t rootConstantOffset = wire.U32(40);
   const uint32_t rootConstantBytes = wire.U32(44);
   const uint32_t samplerOffset = wire.U32(56);
@@ -118,28 +146,33 @@ void PrintLane(const char *label, RadRayDxcLaneView lane) {
   const uint32_t rootSignatureBytes = wire.U32(68);
   std::printf("  rootSignature=%u bytes\n", rootSignatureBytes);
 
-  std::printf("  bindings (%u):\n", bindingBytes / 40);
+  std::printf("  bindings (%u):\n", bindingBytes / 44);
   for (uint32_t offset = bindingOffset; offset < bindingOffset + bindingBytes;
-       offset += 40) {
+       offset += 44) {
+    const std::string payload =
+        PayloadName(wire, typeOffset, typeBytes, wire.U32(offset + 40));
     std::printf("    %-16s group=%u binding=%u kind=%-18s count=%u "
-                "stages=0x%x placement=%-14s sampler=%d flags=0x%x\n",
+                "stages=0x%x placement=%-14s sampler=%d flags=0x%x "
+                "payload=%s\n",
                 wire.Text(offset).c_str(), wire.U32(offset + 8),
                 wire.U32(offset + 12), KindName(wire.U32(offset + 16)),
                 wire.U32(offset + 20), wire.U32(offset + 24),
                 PlacementName(wire.U32(offset + 28)),
                 static_cast<int32_t>(wire.U32(offset + 32)),
-                wire.U32(offset + 36));
+                wire.U32(offset + 36), payload.c_str());
   }
 
-  std::printf("  root constants (%u):\n", rootConstantBytes / 32);
+  std::printf("  root constants (%u):\n", rootConstantBytes / 36);
   for (uint32_t offset = rootConstantOffset;
-       offset < rootConstantOffset + rootConstantBytes; offset += 32) {
+       offset < rootConstantOffset + rootConstantBytes; offset += 36) {
+    const std::string payload =
+        PayloadName(wire, typeOffset, typeBytes, wire.U32(offset + 32));
     std::printf("    %-16s space=%u register=%u offset=%u size=%u stages=0x%x "
-                "flags=0x%x\n",
+                "flags=0x%x payload=%s\n",
                 wire.Text(offset).c_str(), wire.U32(offset + 8),
                 wire.U32(offset + 12), wire.U32(offset + 16),
                 wire.U32(offset + 20), wire.U32(offset + 24),
-                wire.U32(offset + 28));
+                wire.U32(offset + 28), payload.c_str());
   }
 
   std::printf("  samplers (%u):\n", samplerBytes / 64);
@@ -274,6 +307,22 @@ int main(int argc, char **argv) {
   std::printf("compile status=%u\n", static_cast<uint32_t>(status));
   PrintDiagnostics(compiled);
   if (status != RadRayDxcCompileStatus::Success)
+    return 1;
+  IRadRayDxcResult *recompiled = nullptr;
+  if (FAILED(
+          compiler->CompileVariant(compileView, includePaths, &recompiled))) {
+    std::printf("repeat compile call failed\n");
+    return 2;
+  }
+  RadRayDxcCompileStatus repeatedStatus{};
+  recompiled->GetStatus(&repeatedStatus);
+  const bool deterministic =
+      repeatedStatus == RadRayDxcCompileStatus::Success &&
+      SameLaneMetadata(compiled, recompiled, RadRayDxcTarget::DXIL) &&
+      SameLaneMetadata(compiled, recompiled, RadRayDxcTarget::SPIRV);
+  std::printf("metadata deterministic=%s\n",
+              deterministic ? "yes" : "no");
+  if (!deterministic)
     return 1;
 
   RadRayDxcLaneView lane{};

@@ -60,6 +60,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstddef>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -91,9 +92,9 @@ using radray::shader::RadRayDxcTarget;
 // Toolchain identity gates artifact trust on the RadRay side. Bump both values
 // together whenever compiler output semantics change, then regenerate goldens.
 constexpr uint8_t kToolchainIdentity[16] = {
-    0x11, 0x02, 0x09, 0x01, 0x72, 0x61, 0x64, 0x72,
-    0x61, 0x79, 0x2d, 0x31, 0x2e, 0x39, 0x2e, 0x35};
-constexpr uint64_t kMetadataToolchainIdentity = 0x0000000001090211ull;
+    0x12, 0x02, 0x09, 0x01, 0x72, 0x61, 0x64, 0x72,
+    0x61, 0x79, 0x2d, 0x31, 0x2e, 0x39, 0x2e, 0x36};
+constexpr uint64_t kMetadataToolchainIdentity = 0x0000000001090212ull;
 constexpr uint32_t kMaxCollectionCount = 4096;
 
 struct Hash128 {
@@ -510,6 +511,8 @@ struct MetadataBindingFact {
   // Index into MetadataFacts::Samplers. Only the SPIR-V lane fills it: a D3
   // static sampler stays inside the serialized RootSignature carrier.
   uint32_t SamplerIndex{kMetadataNoSampler};
+  // Lane-local root struct that owns this declaration's CPU payload.
+  uint32_t TypeIndex{kMetadataNoType};
   // The declaration's D3 register, recorded on both lanes. It is not published on
   // the wire; it exists so the cross-stage merge can reject a declaration whose
   // register depends on the stage, which would make one name describe different
@@ -607,6 +610,8 @@ struct MetadataRootConstantFact {
   uint32_t Size{0};
   uint32_t StageMask{0};
   uint32_t Flags{0};
+  // Lane-local root struct for the payload, or no type for policy-only facts.
+  uint32_t TypeIndex{kMetadataNoType};
 };
 
 struct MetadataVertexInputFact {
@@ -1528,9 +1533,9 @@ string DxilStructName(const llvm::StructType *type) {
   return name;
 }
 
-void CollectDxilTypeFacts(const hlsl::DxilTypeSystem &typeSystem,
-                          const llvm::StructType *root,
-                          MetadataFacts &facts) {
+uint32_t CollectDxilTypeFacts(const hlsl::DxilTypeSystem &typeSystem,
+                              const llvm::StructType *root,
+                              MetadataFacts &facts) {
   vector<const llvm::StructType *> ordered;
   const auto collectType = [&](const llvm::Type *type, const auto &self) -> void {
     if (const auto *array = llvm::dyn_cast<llvm::ArrayType>(type)) {
@@ -1548,14 +1553,23 @@ void CollectDxilTypeFacts(const hlsl::DxilTypeSystem &typeSystem,
   collectType(root, collectType);
 
   for (const llvm::StructType *type : ordered) {
+    const string typeName = DxilStructName(type);
+    const auto existing = std::find_if(
+        facts.Types.begin(), facts.Types.end(),
+        [&](const MetadataTypeFact &fact) noexcept {
+          return fact.ParentIndex == kMetadataNoParent && fact.Kind == 4u &&
+                 fact.Name == typeName;
+        });
+    if (existing != facts.Types.end())
+      continue;
     const hlsl::DxilStructAnnotation *annotation =
         typeSystem.GetStructAnnotation(type);
     const uint32_t size = annotation != nullptr && annotation->GetCBufferSize() != 0
                               ? annotation->GetCBufferSize()
                               : DxilTypeSize(type, typeSystem);
     const uint32_t parentIndex = static_cast<uint32_t>(facts.Types.size());
-    facts.Types.push_back({DxilStructName(type), kMetadataNoParent, 4u, 1u,
-                           0u, size, size, 0u, kMetadataNoType, {}});
+    facts.Types.push_back({typeName, kMetadataNoParent, 4u, 1u, 0u, size,
+                           size, 0u, kMetadataNoType, {}});
     const uint32_t parentSize = facts.Types[parentIndex].Size;
     vector<uint32_t> offsets;
     offsets.reserve(type->getNumElements());
@@ -1620,7 +1634,18 @@ void CollectDxilTypeFacts(const hlsl::DxilTypeSystem &typeSystem,
     }
   }
 
-  ResolveMetadataTypeIndices(facts.Types);
+  if (!ResolveMetadataTypeIndices(facts.Types))
+    return kMetadataNoType;
+  const string rootName = DxilStructName(root);
+  const auto owner = std::find_if(
+      facts.Types.begin(), facts.Types.end(),
+      [&](const MetadataTypeFact &fact) noexcept {
+        return fact.ParentIndex == kMetadataNoParent && fact.Kind == 4u &&
+               fact.Name == rootName;
+      });
+  return owner == facts.Types.end()
+             ? kMetadataNoType
+             : static_cast<uint32_t>(owner - facts.Types.begin());
 }
 
 uint32_t DxilRegisterClass(hlsl::DXIL::ResourceClass resourceClass) noexcept {
@@ -1665,13 +1690,13 @@ MetadataBindingKind DxilBindingKind(const hlsl::DxilResourceBase &resource) {
   return MetadataBindingKind::Unknown;
 }
 
-void AddDxilResourceFact(const hlsl::DxilResourceBase &resource,
-                         const MetadataDeclarationFact *declaration,
-                         MetadataFacts &facts, ShaderStage stage,
-                         vector<Diagnostic> &diagnostics) {
+MetadataBindingFact *AddDxilResourceFact(
+    const hlsl::DxilResourceBase &resource,
+    const MetadataDeclarationFact *declaration, MetadataFacts &facts,
+    ShaderStage stage, vector<Diagnostic> &diagnostics) {
   const uint32_t registerClass = DxilRegisterClass(resource.GetClass());
   if (registerClass == 0xffffffffu)
-    return;
+    return nullptr;
   const string name = resource.GetGlobalName();
   const MetadataBindingKind lowered = DxilBindingKind(resource);
   const MetadataBindingKind kind =
@@ -1682,13 +1707,13 @@ void AddDxilResourceFact(const hlsl::DxilResourceBase &resource,
     diagnostics.push_back(
         {2118, "resource '" + name +
                    "' has a declaration type outside the RadRay shader contract"});
-    return;
+    return nullptr;
   }
   if (lowered != MetadataBindingKind::Unknown && lowered != kind) {
     diagnostics.push_back(
         {2119, "resource '" + name +
                    "' logical kind disagrees with its DXIL lowering"});
-    return;
+    return nullptr;
   }
   const uint32_t binding = resource.GetLowerBound();
   const uint32_t group = resource.GetSpaceID() == UINT_MAX
@@ -1701,6 +1726,7 @@ void AddDxilResourceFact(const hlsl::DxilResourceBase &resource,
       AddMetadataBinding(facts, name, group, binding, kind, count, stage);
   if (fact != nullptr)
     fact->RegisterClass = registerClass;
+  return fact;
 }
 
 uint32_t DxilRootRangeClass(hlsl::DxilDescriptorRangeType type) noexcept {
@@ -2085,6 +2111,7 @@ void RadRayContractCollector::ApplyRootSignaturePolicy() {
   // What this lane actually observed as a push block, checked against the
   // policy before the policy-derived records replace it.
   const vector<MetadataRootConstantFact> observed = _metadata.RootConstants;
+  const vector<MetadataBindingFact> observedBindings = _metadata.Bindings;
   _metadata.RootConstants.clear();
 
   vector<MetadataBindingFact> bindings;
@@ -2224,6 +2251,21 @@ void RadRayContractCollector::ApplyRootSignaturePolicy() {
     fact.Size = parameter.Num32BitValues * 4u;
     fact.StageMask = stageBit;
     fact.Flags = 0u;
+    for (const MetadataBindingFact &binding : observedBindings)
+      if (binding.RegisterClass == 0u && binding.HasDeclarationRegister &&
+          binding.DeclarationRegisterSpace == parameter.RegisterSpace &&
+          binding.DeclarationRegisterNumber == parameter.BaseRegister)
+        fact.TypeIndex = binding.TypeIndex;
+    for (const MetadataRootConstantFact &observedFact : observed)
+      if (observedFact.RegisterSpace == parameter.RegisterSpace &&
+          observedFact.Register == parameter.BaseRegister &&
+          observedFact.TypeIndex != kMetadataNoType) {
+        if (fact.TypeIndex != kMetadataNoType &&
+            fact.TypeIndex != observedFact.TypeIndex)
+          AddDiagnostic(2124, "root constant payload owner is inconsistent");
+        else
+          fact.TypeIndex = observedFact.TypeIndex;
+      }
     _metadata.RootConstants.push_back(std::move(fact));
   }
 }
@@ -2254,24 +2296,39 @@ void RadRayContractCollector::CollectDxilModule(llvm::Module &module) {
                               "' has no assigned register");
     return false;
   };
-  const auto addResource = [&](const hlsl::DxilResourceBase &resource) {
-    AddDxilResourceFact(resource, FindDeclaration(resource.GetGlobalName()),
-                        _metadata, _stage, _diagnostics);
+  const auto addResource =
+      [&](const hlsl::DxilResourceBase &resource) -> MetadataBindingFact * {
+    return AddDxilResourceFact(
+        resource, FindDeclaration(resource.GetGlobalName()), _metadata, _stage,
+        _diagnostics);
   };
   for (const auto &resource : dxil.GetCBuffers()) {
     if (!requireExplicitBinding(*resource))
       continue;
-    addResource(*resource);
+    MetadataBindingFact *fact = addResource(*resource);
     const llvm::Type *resourceType = resource->GetHLSLType();
     if (resourceType != nullptr && resourceType->isPointerTy())
       resourceType = resourceType->getPointerElementType();
-    if (const auto *wrapper = llvm::dyn_cast_or_null<llvm::StructType>(resourceType)) {
-      if (wrapper->getName().startswith("hostlayout.") &&
-          wrapper->getNumElements() == 1)
+    while (const auto *array =
+               llvm::dyn_cast_or_null<llvm::ArrayType>(resourceType))
+      resourceType = array->getElementType();
+    if (const auto *wrapper =
+            llvm::dyn_cast_or_null<llvm::StructType>(resourceType)) {
+      if (wrapper->getNumElements() == 1 &&
+          llvm::isa<llvm::StructType>(wrapper->getElementType(0)))
         resourceType = wrapper->getElementType(0);
     }
-    if (const auto *type = llvm::dyn_cast<llvm::StructType>(resourceType))
-      CollectDxilTypeFacts(dxil.GetTypeSystem(), type, _metadata);
+    const auto *type =
+        llvm::dyn_cast_or_null<llvm::StructType>(resourceType);
+    const uint32_t typeIndex =
+        type == nullptr
+            ? kMetadataNoType
+            : CollectDxilTypeFacts(dxil.GetTypeSystem(), type, _metadata);
+    if (fact != nullptr)
+      fact->TypeIndex = typeIndex;
+    if (fact != nullptr && typeIndex == kMetadataNoType)
+      _diagnostics.push_back(
+          {2107, "DXIL constant buffer has no valid root type metadata"});
   }
   for (const auto &resource : dxil.GetSamplers())
     if (requireExplicitBinding(*resource))
@@ -2387,10 +2444,10 @@ string SpirvStructName(const clang::spirv::StructType *structure) {
   return name;
 }
 
-void CollectSpirvStructFacts(const clang::spirv::StructType *structure,
-                             MetadataFacts &facts) {
+uint32_t CollectSpirvStructFacts(
+    const clang::spirv::StructType *structure, MetadataFacts &facts) {
   if (structure == nullptr)
-    return;
+    return kMetadataNoType;
   const auto existing = std::find_if(
       facts.Types.begin(), facts.Types.end(),
       [&](const MetadataTypeFact &fact) noexcept {
@@ -2398,7 +2455,7 @@ void CollectSpirvStructFacts(const clang::spirv::StructType *structure,
                fact.Name == SpirvStructName(structure);
       });
   if (existing != facts.Types.end())
-    return;
+    return static_cast<uint32_t>(existing - facts.Types.begin());
   for (const auto &field : structure->getFields()) {
     const clang::spirv::SpirvType *fieldType =
         UnwrapSpirvPointer(field.type);
@@ -2452,7 +2509,9 @@ void CollectSpirvStructFacts(const clang::spirv::StructType *structure,
                            sizeInBytes, stride, 0u, kMetadataNoType,
                            std::move(underlying)});
   }
-  ResolveMetadataTypeIndices(facts.Types);
+  if (!ResolveMetadataTypeIndices(facts.Types))
+    return kMetadataNoType;
+  return parentIndex;
 }
 
 // The final stage-IO location is only decided during module finalization, so
@@ -2630,6 +2689,10 @@ void RadRayContractCollector::CollectSpirvAction(
     const MetadataDeclarationFact *declaration = FindDeclaration(variableName);
     if (pushConstant) {
       const uint32_t size = SpirvTypeSize(valueType);
+      const auto *structure =
+          llvm::dyn_cast<clang::spirv::StructType>(valueType);
+      const uint32_t typeIndex =
+          CollectSpirvStructFacts(structure, _metadata);
       if (declaration == nullptr || !declaration->HasRegister) {
         AddDiagnostic(2120, "push constant block '" + variableName +
                                 "' needs a register() annotation to be placed "
@@ -2643,15 +2706,16 @@ void RadRayContractCollector::CollectSpirvAction(
         fact.Size = size;
         fact.StageMask = stageMask;
         fact.Flags = 1u;
+        fact.TypeIndex = typeIndex;
         _metadata.RootConstants.push_back(std::move(fact));
         _sawPushConstant = true;
+        if (typeIndex == kMetadataNoType)
+          _diagnostics.push_back(
+              {2107, "SPIR-V push constant has no valid root type metadata"});
       } else {
         _diagnostics.push_back(
             {2103, "SPIR-V source contains multiple push constant blocks"});
       }
-      if (const auto *structure =
-              llvm::dyn_cast<clang::spirv::StructType>(valueType))
-        CollectSpirvStructFacts(structure, _metadata);
       continue;
     }
 
@@ -2735,13 +2799,21 @@ void RadRayContractCollector::CollectSpirvAction(
     const uint32_t declarationCount =
         declaration != nullptr && declaration->Count != 0 ? declaration->Count
                                                         : count;
-    AddMetadataBinding(_metadata, variableName, static_cast<uint32_t>(group),
-                       static_cast<uint32_t>(binding), bindingKind,
-                       declarationCount, _stage);
+    MetadataBindingFact *fact =
+        AddMetadataBinding(_metadata, variableName,
+                           static_cast<uint32_t>(group),
+                           static_cast<uint32_t>(binding), bindingKind,
+                           declarationCount, _stage);
     if (bindingKind == MetadataBindingKind::CBuffer) {
       const auto *structure =
           llvm::dyn_cast<clang::spirv::StructType>(valueType);
-      CollectSpirvStructFacts(structure, _metadata);
+      const uint32_t typeIndex =
+          CollectSpirvStructFacts(structure, _metadata);
+      if (fact != nullptr)
+        fact->TypeIndex = typeIndex;
+      if (fact != nullptr && typeIndex == kMetadataNoType)
+        _diagnostics.push_back(
+            {2107, "SPIR-V constant buffer has no valid root type metadata"});
     }
   }
 
@@ -3211,6 +3283,8 @@ struct WireBindingRecord {
   // immutable sampler.
   uint32_t SamplerIndex;
   uint32_t Flags;
+  // Lane-local owner in TypeRecords. Only CBuffer bindings may carry one.
+  uint32_t TypeIndex;
 };
 
 struct WireTypeRecord {
@@ -3234,6 +3308,9 @@ struct WireRootConstantRecord {
   uint32_t Size;
   uint32_t StageMask;
   uint32_t Flags;
+  // Lane-local payload owner in TypeRecords, or 0xffffffff when no live
+  // payload tree exists for this policy declaration.
+  uint32_t TypeIndex;
 };
 
 // A static sampler state in Vulkan terms. Every field holds the official Vulkan
@@ -3269,9 +3346,11 @@ struct WireVertexInputRecord {
 
 static_assert(sizeof(WireEnvelope) == 152);
 static_assert(sizeof(WireEntryRecord) == 24);
-static_assert(sizeof(WireBindingRecord) == 40);
+static_assert(sizeof(WireBindingRecord) == 44);
+static_assert(offsetof(WireBindingRecord, TypeIndex) == 40);
 static_assert(sizeof(WireTypeRecord) == 40);
-static_assert(sizeof(WireRootConstantRecord) == 32);
+static_assert(sizeof(WireRootConstantRecord) == 36);
+static_assert(offsetof(WireRootConstantRecord, TypeIndex) == 32);
 static_assert(sizeof(WireSamplerRecord) == 64);
 static_assert(sizeof(WireVertexInputRecord) == 28);
 
@@ -3281,11 +3360,13 @@ static_assert(sizeof(WireVertexInputRecord) == 28);
 // 2107 now means two stages saw the *same* struct with a different layout.
 bool MergeTypeFacts(vector<MetadataTypeFact> &target,
                     const vector<MetadataTypeFact> &source,
+                    vector<uint32_t> &rootRemap,
                     vector<Diagnostic> &diagnostics) {
   const auto fail = [&diagnostics]() {
     diagnostics.push_back({2107, "frontend stages disagree on type metadata"});
     return false;
   };
+  rootRemap.assign(source.size(), kMetadataNoType);
   for (size_t index = 0; index < source.size();) {
     const MetadataTypeFact &root = source[index];
     if (root.ParentIndex != kMetadataNoParent)
@@ -3301,18 +3382,18 @@ bool MergeTypeFacts(vector<MetadataTypeFact> &target,
           return candidate.ParentIndex == kMetadataNoParent &&
                  candidate.Name == root.Name;
         });
+    uint32_t targetRoot = kMetadataNoType;
     if (found == target.end()) {
-      const uint32_t newParent = static_cast<uint32_t>(target.size());
+      targetRoot = static_cast<uint32_t>(target.size());
       target.push_back(root);
       target.back().TypeIndex = kMetadataNoType;
       for (size_t field = blockBegin + 1; field < blockEnd; ++field) {
         target.push_back(source[field]);
-        target.back().ParentIndex = newParent;
+        target.back().ParentIndex = targetRoot;
         target.back().TypeIndex = kMetadataNoType;
       }
     } else {
-      const uint32_t targetRoot =
-          static_cast<uint32_t>(found - target.begin());
+      targetRoot = static_cast<uint32_t>(found - target.begin());
       vector<size_t> targetFields;
       for (size_t entry = 0; entry < target.size(); ++entry)
         if (target[entry].ParentIndex == targetRoot)
@@ -3336,6 +3417,7 @@ bool MergeTypeFacts(vector<MetadataTypeFact> &target,
           return fail();
       }
     }
+    rootRemap[blockBegin] = targetRoot;
     index = blockEnd;
   }
   if (!ResolveMetadataTypeIndices(target))
@@ -3389,14 +3471,36 @@ bool MergeMetadataFacts(const ContractData &contract,
       facts.Samplers = source.Samplers;
     }
 
-    for (const MetadataBindingFact &binding : source.Bindings) {
+    vector<uint32_t> rootRemap;
+    if (!MergeTypeFacts(facts.Types, source.Types, rootRemap, diagnostics))
+      return false;
+    const auto remapOwner =
+        [&](uint32_t sourceIndex, uint32_t &targetIndex) -> bool {
+      if (sourceIndex == kMetadataNoType) {
+        targetIndex = kMetadataNoType;
+        return true;
+      }
+      if (sourceIndex >= rootRemap.size() ||
+          rootRemap[sourceIndex] == kMetadataNoType) {
+        diagnostics.push_back(
+            {2107, "declaration owner does not reference root type metadata"});
+        return false;
+      }
+      targetIndex = rootRemap[sourceIndex];
+      return true;
+    };
+
+    for (const MetadataBindingFact &sourceBinding : source.Bindings) {
+      MetadataBindingFact binding = sourceBinding;
+      if (!remapOwner(sourceBinding.TypeIndex, binding.TypeIndex))
+        return false;
       const auto found = std::find_if(
           facts.Bindings.begin(), facts.Bindings.end(),
           [&](const MetadataBindingFact &value) noexcept {
             return value.Name == binding.Name;
           });
       if (found == facts.Bindings.end()) {
-        facts.Bindings.push_back(binding);
+        facts.Bindings.push_back(std::move(binding));
         continue;
       }
       if (found->Group != binding.Group || found->Binding != binding.Binding ||
@@ -3404,6 +3508,7 @@ bool MergeMetadataFacts(const ContractData &contract,
           found->Type != binding.Type || found->Count != binding.Count ||
           found->Placement != binding.Placement ||
           found->SamplerIndex != binding.SamplerIndex ||
+          found->TypeIndex != binding.TypeIndex ||
           found->HasDeclarationRegister != binding.HasDeclarationRegister ||
           (binding.HasDeclarationRegister &&
            (found->DeclarationRegisterSpace != binding.DeclarationRegisterSpace ||
@@ -3416,10 +3521,11 @@ bool MergeMetadataFacts(const ContractData &contract,
       found->Flags |= binding.Flags;
     }
 
-    if (!MergeTypeFacts(facts.Types, source.Types, diagnostics))
-      return false;
-
-    for (const MetadataRootConstantFact &constant : source.RootConstants) {
+    for (const MetadataRootConstantFact &sourceConstant :
+         source.RootConstants) {
+      MetadataRootConstantFact constant = sourceConstant;
+      if (!remapOwner(sourceConstant.TypeIndex, constant.TypeIndex))
+        return false;
       const auto found = std::find_if(
           facts.RootConstants.begin(), facts.RootConstants.end(),
           [&](const MetadataRootConstantFact &value) noexcept {
@@ -3428,15 +3534,20 @@ bool MergeMetadataFacts(const ContractData &contract,
                    value.Register == constant.Register;
           });
       if (found == facts.RootConstants.end()) {
-        facts.RootConstants.push_back(constant);
+        facts.RootConstants.push_back(std::move(constant));
         continue;
       }
       if (found->Offset != constant.Offset || found->Size != constant.Size ||
-          found->Flags != constant.Flags) {
+          found->Flags != constant.Flags ||
+          (found->TypeIndex != kMetadataNoType &&
+           constant.TypeIndex != kMetadataNoType &&
+           found->TypeIndex != constant.TypeIndex)) {
         diagnostics.push_back(
             {2124, "frontend stages disagree on a push constant block"});
         return false;
       }
+      if (found->TypeIndex == kMetadataNoType)
+        found->TypeIndex = constant.TypeIndex;
       found->StageMask |= constant.StageMask;
     }
 
@@ -3475,6 +3586,31 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
   MetadataFacts facts;
   if (!MergeMetadataFacts(contract, target, stages, facts, diagnostics))
     return false;
+  const auto isRootStruct = [&](uint32_t typeIndex) noexcept {
+    return typeIndex < facts.Types.size() &&
+           facts.Types[typeIndex].ParentIndex == kMetadataNoParent &&
+           facts.Types[typeIndex].Kind == 4u;
+  };
+  for (const MetadataBindingFact &binding : facts.Bindings) {
+    const bool cbuffer =
+        binding.Type == static_cast<uint32_t>(MetadataBindingKind::CBuffer);
+    if ((cbuffer && !isRootStruct(binding.TypeIndex)) ||
+        (!cbuffer && binding.TypeIndex != kMetadataNoType)) {
+      diagnostics.push_back(
+          {2109, "resource binding has an invalid payload owner"});
+      return false;
+    }
+  }
+  for (const MetadataRootConstantFact &constant : facts.RootConstants) {
+    if (constant.TypeIndex == kMetadataNoType)
+      continue;
+    if (!isRootStruct(constant.TypeIndex) ||
+        facts.Types[constant.TypeIndex].Size > constant.Size) {
+      diagnostics.push_back(
+          {2124, "root constant has an invalid payload owner"});
+      return false;
+    }
+  }
 
   const uint32_t entryOffset = sizeof(WireEnvelope);
   const uint32_t entryBytes = static_cast<uint32_t>(
@@ -3561,6 +3697,7 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
     record.Placement = fact.Placement;
     record.SamplerIndex = fact.SamplerIndex;
     record.Flags = fact.Flags;
+    record.TypeIndex = fact.TypeIndex;
     bindings.push_back(record);
     currentNameOffset += static_cast<uint32_t>(fact.Name.size());
   }
@@ -3593,6 +3730,7 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
     record.Size = fact.Size;
     record.StageMask = fact.StageMask;
     record.Flags = fact.Flags;
+    record.TypeIndex = fact.TypeIndex;
     rootConstants.push_back(record);
     currentNameOffset += static_cast<uint32_t>(fact.Name.size());
   }
@@ -3642,13 +3780,17 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
   if (facts.HasRootSignature)
     for (const uint8_t value : facts.RootSignatureHash.Bytes)
       AppendByte(layoutBytes, value);
-  if (!bindings.empty()) {
-    const auto *data = reinterpret_cast<const uint8_t *>(bindings.data());
-    layoutBytes.insert(layoutBytes.end(), data, data + bindingBytes);
+  for (const WireBindingRecord &binding : bindings) {
+    const auto *data = reinterpret_cast<const uint8_t *>(&binding);
+    layoutBytes.insert(
+        layoutBytes.end(), data,
+        data + offsetof(WireBindingRecord, TypeIndex));
   }
-  if (!rootConstants.empty()) {
-    const auto *data = reinterpret_cast<const uint8_t *>(rootConstants.data());
-    layoutBytes.insert(layoutBytes.end(), data, data + rootConstantBytes);
+  for (const WireRootConstantRecord &constant : rootConstants) {
+    const auto *data = reinterpret_cast<const uint8_t *>(&constant);
+    layoutBytes.insert(
+        layoutBytes.end(), data,
+        data + offsetof(WireRootConstantRecord, TypeIndex));
   }
   if (!vertexInputs.empty()) {
     const auto *data = reinterpret_cast<const uint8_t *>(vertexInputs.data());

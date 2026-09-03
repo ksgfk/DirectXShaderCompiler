@@ -1,7 +1,7 @@
 """Compiler-side regression matrix for the RadRay shader layout contract.
 
 Builds utils/radray_wire_probe.cpp against a freshly built dxcompiler and drives
-it over utils/radray_probe_tests, asserting the schema 6 wire each fixture must
+it over utils/radray_probe_tests, asserting the schema 7 wire each fixture must
 produce and the diagnostic each rejected fixture must raise. This is the
 compiler-side vehicle: it needs no RadRay checkout, so the fork stays verifiable
 on its own.
@@ -10,8 +10,8 @@ on its own.
                                         [--case NAME] [--verbose]
 
 Expected output is matched line by line after normalization, so payload sizes -
-which move with any codegen change - never fail the matrix, while placements,
-kinds, counts, stage masks, sampler states and diagnostics do.
+which move with any codegen change - never fail the matrix, while declaration
+owners, placements, kinds, counts, stage masks, sampler states and diagnostics do.
 """
 
 import argparse
@@ -40,36 +40,38 @@ CASES = {
     # Every placement the policy can produce, on both targets at once.
     "ok_policy.hlsl": (BOTH, 0, [
         "DXIL lane",
-        "schema=6 headerSize=152 target=0 stageMask=0x3",
+        "schema=7 headerSize=152 target=0 stageMask=0x3",
         "rootSignature=260 bytes",
         "Scene group=0 binding=1 kind=CBuffer count=1 stages=0x1 "
-        "placement=RootDescriptor sampler=-1 flags=0x0",
+        "placement=RootDescriptor sampler=-1 flags=0x0 payload=SceneData",
         "Albedo group=0 binding=0 kind=Texture count=2 stages=0x2 "
-        "placement=Table sampler=-1 flags=0x0",
+        "placement=Table sampler=-1 flags=0x0 payload=none",
         "Points group=0 binding=2 kind=StructuredBuffer count=1 stages=0x2 "
-        "placement=RootDescriptor sampler=-1 flags=0x0",
+        "placement=RootDescriptor sampler=-1 flags=0x0 payload=none",
         "Output group=0 binding=0 kind=RWStructuredBuffer count=1 stages=0x2 "
-        "placement=Table sampler=-1 flags=0x0",
+        "placement=Table sampler=-1 flags=0x0 payload=none",
         "LinearClamp group=0 binding=0 kind=Sampler count=1 stages=0x2 "
-        "placement=StaticSampler sampler=-1 flags=0x0",
-        "Push space=0 register=0 offset=0 size=16 stages=0x3 flags=0x0",
+        "placement=StaticSampler sampler=-1 flags=0x0 payload=none",
+        "Push space=0 register=0 offset=0 size=16 stages=0x3 flags=0x0 "
+        "payload=PushData",
         "samplers (0):",
         "SPIRV lane",
-        "schema=6 headerSize=152 target=1 stageMask=0x3",
+        "schema=7 headerSize=152 target=1 stageMask=0x3",
         # Vulkan reads its immutable samplers from the records, so no carrier.
         "rootSignature=0 bytes",
         "Scene group=0 binding=0 kind=CBuffer count=1 stages=0x1 "
-        "placement=RootDescriptor sampler=-1 flags=0x0",
+        "placement=RootDescriptor sampler=-1 flags=0x0 payload=SceneData",
         "Albedo group=0 binding=1 kind=Texture count=2 stages=0x2 "
-        "placement=Table sampler=-1 flags=0x0",
+        "placement=Table sampler=-1 flags=0x0 payload=none",
         "Output group=0 binding=3 kind=RWStructuredBuffer count=1 stages=0x2 "
-        "placement=Table sampler=-1 flags=0x0",
+        "placement=Table sampler=-1 flags=0x0 payload=none",
         "Points group=0 binding=4 kind=StructuredBuffer count=1 stages=0x2 "
-        "placement=RootDescriptor sampler=-1 flags=0x0",
+        "placement=RootDescriptor sampler=-1 flags=0x0 payload=none",
         # A D3D static sampler becomes a table slot plus an immutable record.
         "LinearClamp group=0 binding=5 kind=Sampler count=1 stages=0x2 "
-        "placement=Table sampler=0 flags=0x0",
-        "Push space=0 register=0 offset=0 size=16 stages=0x3 flags=0x0",
+        "placement=Table sampler=0 flags=0x0 payload=none",
+        "Push space=0 register=0 offset=0 size=16 stages=0x3 flags=0x0 "
+        "payload=PushData",
         "samplers (1):",
         "mag=1 min=1 mip=1 addr=2/3/0 bias=0.0 aniso=0/1.0 cmp=0/3 "
         "lod=0.0..8.0 border=4 reduction=0 flags=0x0",
@@ -79,11 +81,11 @@ CASES = {
     "ok_no_policy.hlsl": (BOTH, 0, [
         "rootSignature=0 bytes",
         "A group=0 binding=0 kind=CBuffer count=1 stages=0x2 placement=Table "
-        "sampler=-1 flags=0x0",
+        "sampler=-1 flags=0x0 payload=SceneData",
         "Raw group=0 binding=1 kind=RawBuffer count=1 stages=0x2 "
-        "placement=Table sampler=-1 flags=0x0",
+        "placement=Table sampler=-1 flags=0x0 payload=none",
         "Typed group=0 binding=0 kind=RWTypedBuffer count=1 stages=0x2 "
-        "placement=Table sampler=-1 flags=0x0",
+        "placement=Table sampler=-1 flags=0x0 payload=none",
         "root constants (0):",
         "samplers (0):",
         "!placement=RootDescriptor",
@@ -93,13 +95,13 @@ CASES = {
     # The D3D -> Vulkan sampler translation, including the reduction modes.
     "ok_sampler_states.hlsl": (BOTH, 0, [
         "Shadow group=0 binding=0 kind=Sampler count=1 stages=0x2 "
-        "placement=StaticSampler sampler=-1 flags=0x0",
+        "placement=StaticSampler sampler=-1 flags=0x0 payload=none",
         "Shadow group=0 binding=1 kind=Sampler count=1 stages=0x2 "
-        "placement=Table sampler=0 flags=0x0",
+        "placement=Table sampler=0 flags=0x0 payload=none",
         "MinPoint group=0 binding=1 kind=Sampler count=1 stages=0x2 "
-        "placement=StaticSampler sampler=-1 flags=0x0",
+        "placement=StaticSampler sampler=-1 flags=0x0 payload=none",
         "MinPoint group=0 binding=2 kind=Sampler count=1 stages=0x2 "
-        "placement=Table sampler=1 flags=0x0",
+        "placement=Table sampler=1 flags=0x0 payload=none",
         "samplers (2):",
         # COMPARISON_ANISOTROPIC: linear everywhere, anisotropy on, compare on,
         # GREATER -> 4, MIRROR/MIRROR_ONCE/BORDER -> 1/4/3, unset maxLOD -> none.
@@ -112,11 +114,42 @@ CASES = {
 
     # Compute collapses to one stage bit on both lanes.
     "ok_compute.hlsl": (BOTH, 0, [
-        "schema=6 headerSize=152 target=0 stageMask=0x4",
-        "schema=6 headerSize=152 target=1 stageMask=0x4",
+        "schema=7 headerSize=152 target=0 stageMask=0x4",
+        "schema=7 headerSize=152 target=1 stageMask=0x4",
         "Scene group=0 binding=1 kind=CBuffer count=1 stages=0x4 "
-        "placement=RootDescriptor sampler=-1 flags=0x0",
-        "Push space=0 register=0 offset=0 size=4 stages=0x4 flags=0x0",
+        "placement=RootDescriptor sampler=-1 flags=0x0 payload=SceneData",
+        "Push space=0 register=0 offset=0 size=4 stages=0x4 flags=0x0 "
+        "payload=PushData",
+    ]),
+
+    # Two declarations share one canonical root block in each target lane.
+    "ok_shared_root.hlsl": (BOTH, 0, [
+        "schema=7 headerSize=152 target=0 stageMask=0x3",
+        "First group=0 binding=0 kind=CBuffer count=1 stages=0x1 "
+        "placement=Table sampler=-1 flags=0x0 payload=SharedRoot",
+        "Second group=0 binding=1 kind=CBuffer count=1 stages=0x2 "
+        "placement=Table sampler=-1 flags=0x0 payload=SharedRoot",
+        "schema=7 headerSize=152 target=1 stageMask=0x3",
+        "First group=0 binding=4 kind=CBuffer count=1 stages=0x1 "
+        "placement=Table sampler=-1 flags=0x0 payload=SharedRoot",
+        "Second group=0 binding=5 kind=CBuffer count=1 stages=0x2 "
+        "placement=Table sampler=-1 flags=0x0 payload=SharedRoot",
+        "metadata deterministic=yes",
+    ]),
+
+    # A directly bound root remains the nested member target of another root.
+    "ok_nested_roots.hlsl": (BOTH, 0, [
+        "schema=7 headerSize=152 target=0 stageMask=0x3",
+        "Inner group=0 binding=0 kind=CBuffer count=1 stages=0x1 "
+        "placement=Table sampler=-1 flags=0x0 payload=InnerRoot",
+        "Outer group=0 binding=1 kind=CBuffer count=1 stages=0x2 "
+        "placement=Table sampler=-1 flags=0x0 payload=OuterRoot",
+        "schema=7 headerSize=152 target=1 stageMask=0x3",
+        "Inner group=0 binding=6 kind=CBuffer count=1 stages=0x1 "
+        "placement=Table sampler=-1 flags=0x0 payload=InnerRoot",
+        "Outer group=0 binding=7 kind=CBuffer count=1 stages=0x2 "
+        "placement=Table sampler=-1 flags=0x0 payload=OuterRoot",
+        "metadata deterministic=yes",
     ]),
 
     # A policy that cannot be parsed at all.
@@ -147,11 +180,11 @@ CASES = {
     ]),
     "neg_uncovered.hlsl@spirv": (SPIRV, 0, [
         "A group=0 binding=0 kind=CBuffer count=1 stages=0x2 "
-        "placement=RootDescriptor sampler=-1 flags=0x0",
+        "placement=RootDescriptor sampler=-1 flags=0x0 payload=SceneData",
         "Extra group=0 binding=1 kind=Texture count=1 stages=0x2 "
-        "placement=Table sampler=-1 flags=0x0",
+        "placement=Table sampler=-1 flags=0x0 payload=none",
         "S group=0 binding=2 kind=Sampler count=1 stages=0x2 placement=Table "
-        "sampler=-1 flags=0x0",
+        "sampler=-1 flags=0x0 payload=none",
     ]),
 
     # Only a single buffer can be reached through a root descriptor.
@@ -240,8 +273,8 @@ def check(name, probe, verbose):
     if verbose:
         sys.stdout.write(output)
     schema = re.search(r"schema=(\d+)", output)
-    if schema is not None and int(schema.group(1)) != 6:
-        return ["probe read schema %s, expected 6: the dxcompiler in this build "
+    if schema is not None and int(schema.group(1)) != 7:
+        return ["probe read schema %s, expected 7: the dxcompiler in this build "
                 "tree predates the contract, rebuild the dxcompiler target"
                 % schema.group(1)]
     result.stdout = output
