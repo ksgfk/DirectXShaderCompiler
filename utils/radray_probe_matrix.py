@@ -1,7 +1,7 @@
 """Compiler-side regression matrix for the RadRay shader layout contract.
 
 Builds utils/radray_wire_probe.cpp against a freshly built dxcompiler and drives
-it over utils/radray_probe_tests, asserting the schema 7 wire each fixture must
+it over utils/radray_probe_tests, asserting the schema 8 wire each fixture must
 produce and the diagnostic each rejected fixture must raise. This is the
 compiler-side vehicle: it needs no RadRay checkout, so the fork stays verifiable
 on its own.
@@ -40,7 +40,7 @@ CASES = {
     # Every placement the policy can produce, on both targets at once.
     "ok_policy.hlsl": (BOTH, 0, [
         "DXIL lane",
-        "schema=7 headerSize=152 target=0 stageMask=0x3",
+        "schema=8 headerSize=152 target=0 stageMask=0x3",
         "rootSignature=260 bytes",
         "Scene group=0 binding=1 kind=CBuffer count=1 stages=0x1 "
         "placement=RootDescriptor sampler=-1 flags=0x0 payload=SceneData",
@@ -56,7 +56,7 @@ CASES = {
         "payload=PushData",
         "samplers (0):",
         "SPIRV lane",
-        "schema=7 headerSize=152 target=1 stageMask=0x3",
+        "schema=8 headerSize=152 target=1 stageMask=0x3",
         # Vulkan reads its immutable samplers from the records, so no carrier.
         "rootSignature=0 bytes",
         "Scene group=0 binding=0 kind=CBuffer count=1 stages=0x1 "
@@ -114,22 +114,40 @@ CASES = {
 
     # Compute collapses to one stage bit on both lanes.
     "ok_compute.hlsl": (BOTH, 0, [
-        "schema=7 headerSize=152 target=0 stageMask=0x4",
-        "schema=7 headerSize=152 target=1 stageMask=0x4",
+        "schema=8 headerSize=152 target=0 stageMask=0x4",
+        "schema=8 headerSize=152 target=1 stageMask=0x4",
         "Scene group=0 binding=1 kind=CBuffer count=1 stages=0x4 "
         "placement=RootDescriptor sampler=-1 flags=0x0 payload=SceneData",
         "Push space=0 register=0 offset=0 size=4 stages=0x4 flags=0x0 "
         "payload=PushData",
     ]),
 
+    # Schema 8 publishes scalar kind, matrix shape, and non-struct array elements.
+    "ok_type_payload.hlsl": (BOTH, 0, [
+        "schema=8 headerSize=152 target=0 stageMask=0x4",
+        "schema=8 headerSize=152 target=1 stageMask=0x4",
+        "Payload group=0 binding=0 kind=CBuffer count=1 stages=0x4 "
+        "placement=Table sampler=-1 flags=0x0 payload=PayloadData",
+        "Transform         parent=0 kind=Matrix count=1 offset=0 size=64 "
+        "stride=64 flags=0x0 scalar=float rows=4 cols=4 nested=none",
+        "ShadowSphere      parent=0 kind=Array  count=4 offset=64 size=64 "
+        "stride=16 flags=0x0 scalar=float rows=1 cols=4 nested=none",
+        "Count             parent=0 kind=Scalar count=1 offset=128 size=4 "
+        "stride=4 flags=0x0 scalar=uint rows=1 cols=1 nested=none",
+        "SignedCount       parent=0 kind=Scalar count=1 offset=132 size=4 "
+        "stride=4 flags=0x0 scalar=sint rows=1 cols=1 nested=none",
+        "Scale             parent=0 kind=Scalar count=1 offset=136 size=4 "
+        "stride=4 flags=0x0 scalar=float rows=1 cols=1 nested=none",
+    ]),
+
     # Two declarations share one canonical root block in each target lane.
     "ok_shared_root.hlsl": (BOTH, 0, [
-        "schema=7 headerSize=152 target=0 stageMask=0x3",
+        "schema=8 headerSize=152 target=0 stageMask=0x3",
         "First group=0 binding=0 kind=CBuffer count=1 stages=0x1 "
         "placement=Table sampler=-1 flags=0x0 payload=SharedRoot",
         "Second group=0 binding=1 kind=CBuffer count=1 stages=0x2 "
         "placement=Table sampler=-1 flags=0x0 payload=SharedRoot",
-        "schema=7 headerSize=152 target=1 stageMask=0x3",
+        "schema=8 headerSize=152 target=1 stageMask=0x3",
         "First group=0 binding=4 kind=CBuffer count=1 stages=0x1 "
         "placement=Table sampler=-1 flags=0x0 payload=SharedRoot",
         "Second group=0 binding=5 kind=CBuffer count=1 stages=0x2 "
@@ -139,12 +157,12 @@ CASES = {
 
     # A directly bound root remains the nested member target of another root.
     "ok_nested_roots.hlsl": (BOTH, 0, [
-        "schema=7 headerSize=152 target=0 stageMask=0x3",
+        "schema=8 headerSize=152 target=0 stageMask=0x3",
         "Inner group=0 binding=0 kind=CBuffer count=1 stages=0x1 "
         "placement=Table sampler=-1 flags=0x0 payload=InnerRoot",
         "Outer group=0 binding=1 kind=CBuffer count=1 stages=0x2 "
         "placement=Table sampler=-1 flags=0x0 payload=OuterRoot",
-        "schema=7 headerSize=152 target=1 stageMask=0x3",
+        "schema=8 headerSize=152 target=1 stageMask=0x3",
         "Inner group=0 binding=6 kind=CBuffer count=1 stages=0x1 "
         "placement=Table sampler=-1 flags=0x0 payload=InnerRoot",
         "Outer group=0 binding=7 kind=CBuffer count=1 stages=0x2 "
@@ -273,8 +291,8 @@ def check(name, probe, verbose):
     if verbose:
         sys.stdout.write(output)
     schema = re.search(r"schema=(\d+)", output)
-    if schema is not None and int(schema.group(1)) != 7:
-        return ["probe read schema %s, expected 7: the dxcompiler in this build "
+    if schema is not None and int(schema.group(1)) != 8:
+        return ["probe read schema %s, expected 8: the dxcompiler in this build "
                 "tree predates the contract, rebuild the dxcompiler target"
                 % schema.group(1)]
     result.stdout = output

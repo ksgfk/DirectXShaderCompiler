@@ -26,7 +26,7 @@ endif()
 project(LLVM)
 
 include(CMakePackageConfigHelpers)
-set(RADRAY_DXC_PACKAGE_VERSION "1.9.2607.radray.6")
+set(RADRAY_DXC_PACKAGE_VERSION "1.9.2607.radray.7")
 configure_package_config_file(
   ${CMAKE_SOURCE_DIR}/cmake/RadRayDXCConfig.cmake.in
   ${CMAKE_BINARY_DIR}/RadRayDXCConfig.cmake

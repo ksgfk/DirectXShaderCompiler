@@ -41,7 +41,7 @@ from pathlib import Path
 
 DISTRIBUTION_COMPONENTS = ("dxc", "dxcompiler", "dxc-headers")
 BUILD_TARGETS = ("dxc", "dxcompiler", "dxildll")
-DEFAULT_VERSION = "1.9.2607.radray.6"
+DEFAULT_VERSION = "1.9.2607.radray.7"
 VERSION_RE = re.compile(r'set\(RADRAY_DXC_PACKAGE_VERSION\s+"([^"]+)"\)')
 
 

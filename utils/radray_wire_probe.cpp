@@ -1,5 +1,5 @@
 // Standalone probe for the RadRay DXC extension. Drives DiscoverSourceContract
-// plus CompileVariant against a source file and prints the decoded schema 7 wire
+// plus CompileVariant against a source file and prints the decoded schema 8 wire
 // so the compiler-side contract can be verified without the RadRay tree.
 //
 // Build (from the fork root, with a VS developer prompt or -I to the SDK):
@@ -100,13 +100,47 @@ const char *PlacementName(uint32_t placement) {
 std::string PayloadName(const Wire &wire, uint32_t typeOffset,
                         uint32_t typeBytes, uint32_t typeIndex) {
   constexpr uint32_t kNoType = 0xffffffffu;
-  constexpr uint32_t kTypeStride = 40u;
+  constexpr uint32_t kTypeStride = 52u;
   if (typeIndex == kNoType)
     return std::string("none");
   if ((typeBytes % kTypeStride) != 0 ||
       typeIndex >= typeBytes / kTypeStride)
     return std::string("bad-index");
   return wire.Text(typeOffset + typeIndex * kTypeStride);
+}
+
+const char *TypeKindName(uint32_t kind) {
+  switch (kind) {
+  case 1:
+    return "Scalar";
+  case 2:
+    return "Vector";
+  case 3:
+    return "Matrix";
+  case 4:
+    return "Struct";
+  case 5:
+    return "Array";
+  default:
+    return "?";
+  }
+}
+
+const char *ScalarKindName(uint32_t kind) {
+  switch (kind) {
+  case 0:
+    return "none";
+  case 1:
+    return "float";
+  case 2:
+    return "sint";
+  case 3:
+    return "uint";
+  case 4:
+    return "bool";
+  default:
+    return "?";
+  }
 }
 
 bool SameLaneMetadata(IRadRayDxcResult *left, IRadRayDxcResult *right,
@@ -129,7 +163,7 @@ void PrintLane(const char *label, RadRayDxcLaneView lane) {
   std::printf("\n=== %s lane: metadata %u bytes, bytecode %u bytes ===\n", label,
               lane.Metadata.Size, lane.Bytecode.Size);
   if (wire.Size < 152) {
-    std::printf("  metadata too small for a schema 7 envelope\n");
+    std::printf("  metadata too small for a schema 8 envelope\n");
     return;
   }
   std::printf("  schema=%u headerSize=%u total=%u target=%u stageMask=0x%x\n",
@@ -160,6 +194,23 @@ void PrintLane(const char *label, RadRayDxcLaneView lane) {
                 PlacementName(wire.U32(offset + 28)),
                 static_cast<int32_t>(wire.U32(offset + 32)),
                 wire.U32(offset + 36), payload.c_str());
+  }
+
+  constexpr uint32_t kTypeStride = 52u;
+  std::printf("  types (%u):\n", typeBytes / kTypeStride);
+  for (uint32_t offset = typeOffset; offset < typeOffset + typeBytes;
+       offset += kTypeStride) {
+    const uint32_t parent = wire.U32(offset + 8);
+    const uint32_t kind = wire.U32(offset + 12);
+    const uint32_t typeIndex = wire.U32(offset + 36);
+    std::printf("    %-16s parent=%d kind=%-6s count=%u offset=%u size=%u "
+                "stride=%u flags=0x%x scalar=%s rows=%u cols=%u nested=%s\n",
+                wire.Text(offset).c_str(), static_cast<int32_t>(parent),
+                TypeKindName(kind), wire.U32(offset + 16), wire.U32(offset + 20),
+                wire.U32(offset + 24), wire.U32(offset + 28), wire.U32(offset + 32),
+                ScalarKindName(wire.U32(offset + 40)), wire.U32(offset + 44),
+                wire.U32(offset + 48),
+                PayloadName(wire, typeOffset, typeBytes, typeIndex).c_str());
   }
 
   std::printf("  root constants (%u):\n", rootConstantBytes / 36);
