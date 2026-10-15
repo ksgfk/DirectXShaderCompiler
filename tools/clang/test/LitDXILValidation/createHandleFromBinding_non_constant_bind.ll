@@ -15,7 +15,7 @@ target triple = "dxil-ms-dx"
 define void @main(i32 %lowerBound) {
   ; Construct a non-constant bind struct using a function parameter
   %1 = insertvalue %dx.types.ResBind { i32 undef, i32 1, i32 0, i8 1 }, i32 %lowerBound, 0
-  ; Pass non-constant bind to createHandleFromBinding — should fail validation
+  ; Pass non-constant bind to createHandleFromBinding; should fail validation
   %2 = call %dx.types.Handle @dx.op.createHandleFromBinding(i32 217, %dx.types.ResBind %1, i32 0, i1 false)  ; CreateHandleFromBinding(bind,index,nonUniformIndex)
   %3 = call %dx.types.Handle @dx.op.annotateHandle(i32 216, %dx.types.Handle %2, %dx.types.ResourceProperties { i32 4107, i32 0 })  ; AnnotateHandle(res,props)  resource: RWByteAddressBuffer
   ret void

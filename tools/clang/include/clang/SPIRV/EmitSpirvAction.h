@@ -13,13 +13,22 @@
 
 namespace clang {
 
+namespace spirv {
+class SpirvEmitter;
+}
+
 class EmitSpirvAction : public ASTFrontendAction {
 public:
   EmitSpirvAction() {}
 
+  spirv::SpirvEmitter *getSpirvEmitter() const { return emitter; }
+
 protected:
   std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI,
                                                  StringRef InFile) override;
+
+private:
+  spirv::SpirvEmitter *emitter{nullptr};
 };
 
 } // end namespace clang

@@ -207,6 +207,13 @@ public:
                             FeatureManager &features,
                             const SpirvCodeGenOptions &spirvOptions);
 
+  // Fork-private RadRay accessors: expose final-module stage/resource facts to
+  // the RadRay metadata observer. Not part of the upstream DXC interface.
+  llvm::ArrayRef<StageVar> getStageVarsForRadRay() const { return stageVars; }
+  llvm::ArrayRef<ResourceVar> getResourceVarsForRadRay() const {
+    return resourceVars;
+  }
+
   /// \brief Returns the SPIR-V builtin variable. Uses sc as default storage
   /// class.
   SpirvVariable *getBuiltinVar(spv::BuiltIn builtIn, QualType type,
@@ -478,6 +485,16 @@ public:
   /// This method will panic if the given decl is not registered.
   SpirvInstruction *getDeclEvalInfo(const ValueDecl *decl, SourceLocation loc,
                                     SourceRange range = {});
+
+  /// \brief Returns the instruction for a decl if it has already been
+  /// registered, without creating a lazy declaration.
+  ///
+  /// This is used by compiler-owned semantic observers that need to relate an
+  /// AST reference to the final SPIR-V instruction model.
+  SpirvInstruction *getDeclEvalInfoIfRegistered(const ValueDecl *decl) const {
+    const DeclSpirvInfo *info = getDeclSpirvInfo(decl);
+    return info != nullptr ? info->instr : nullptr;
+  }
 
   /// \brief Returns the instruction pointer for the given function if already
   /// registered; otherwise, treats the given function as a normal decl and

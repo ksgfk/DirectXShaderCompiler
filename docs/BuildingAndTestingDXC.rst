@@ -131,6 +131,40 @@ have the following targets available:
 **check-clang** Runs the Clang tests after rebuilding any required out-of-date targets.
 **check-all** Runs all available tests after rebuilding any out-of-date targets.
 
+RadRay Extension Tests (Windows)
+-------------------------------
+
+The RadRay fork is based on upstream ``v1.9.2609`` and packages as
+``1.9.2609.radray.1``. It retains extension ABI 5 and metadata schema 8. The
+metadata toolchain identity is ``0x0000000001090214``; the 128-bit ABI identity
+also changes so artifacts and compiler caches from the July toolchain are not
+reused. Consumers must update their accepted toolchain identity and rebuild
+artifacts when adopting this package.
+
+Configure with ``HLSL_INCLUDE_TESTS=ON``, ``LLVM_INCLUDE_TESTS=ON`` and
+``ENABLE_SPIRV_CODEGEN=ON``. The ``ClangHLSLTests`` TAEF suite includes
+``CompilerTest::RadRayExtensionAbiAndDiscovery``. The ``RadRay`` lit suite
+exercises both DXIL and SPIR-V metadata, root signature policies, sampler
+translation, type payloads, deterministic metadata and rejected declarations.
+Its 16 fixtures cover 18 target combinations, using the CMake-built
+``radray_wire_probe`` and FileCheck. These tests participate in ``check-clang``
+and ``check-all``; they do not require a RadRay checkout or a separate Python
+test runner.
+
+.. code-block:: sh
+
+  cmake --build build_radray --config Release --target clang-test-depends --parallel
+  cmake --build build_radray --config Release --target check-radray
+  cmake --build build_radray --config Release --target check-clang-taef
+
+``check-radray`` only runs the extension lit suite. The TAEF target runs the
+compiler unit suite, including the ABI/discovery test. Build dependencies before
+running tests. Use the package script after successful validation:
+
+.. code-block:: sh
+
+  python utils/package_radray_sdk.py --build build_radray --config Release --no-build
+
 Useful CMake Options
 --------------------
 

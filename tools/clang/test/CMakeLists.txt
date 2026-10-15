@@ -85,6 +85,9 @@ if (WIN32)
 list(APPEND CLANG_TEST_DEPS
      dxc_batch ExecHLSLTests dxildll
     )
+if (HLSL_INCLUDE_TESTS)
+  list(APPEND CLANG_TEST_DEPS radray_wire_probe)
+endif()
 else()
 list(APPEND CLANG_TEST_DEPS
      dxildll
@@ -214,6 +217,14 @@ add_lit_testsuites(CLANG ${CMAKE_CURRENT_SOURCE_DIR}
   DEPENDS ${CLANG_TEST_DEPS}
   FOLDER "Clang tests/Suites"
 )
+
+if (WIN32 AND HLSL_INCLUDE_TESTS)
+  add_lit_target(check-radray "Running RadRay extension regression tests"
+    ${CMAKE_CURRENT_SOURCE_DIR}/RadRay
+    PARAMS ${CLANG_TEST_PARAMS}
+    DEPENDS ${CLANG_TEST_DEPS}
+    ARGS ${CLANG_TEST_EXTRA_ARGS})
+endif()
 
 
 # add_lit_testsuites doesn't generate targets for Visual Studio or Xcode builds

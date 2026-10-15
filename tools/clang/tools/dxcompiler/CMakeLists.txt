@@ -49,6 +49,7 @@ set(LLVM_LINK_COMPONENTS
 if (WIN32)
 set(SOURCES
   dxcapi.cpp
+  dxcradray.cpp
   dxcassembler.cpp
   dxclibrary.cpp
   dxcompilerobj.cpp
@@ -133,6 +134,8 @@ endif()
 target_link_libraries(dxcompiler PRIVATE ${LIBRARIES})
 if (ENABLE_SPIRV_CODEGEN)
   target_link_libraries(dxcompiler PRIVATE clangSPIRV)
+  target_include_directories(dxcompiler PRIVATE
+    ${LLVM_SOURCE_DIR}/tools/clang/lib/SPIRV)
 endif (ENABLE_SPIRV_CODEGEN)
 if (ENABLE_METAL_CODEGEN)
   target_link_libraries(dxcompiler PRIVATE ${MetalIRConverter_LIB})
@@ -152,17 +155,26 @@ set_target_properties(dxcompiler
   DEFINE_SYMBOL _CINDEX_LIB_)
 
 if (WIN32)
-  set(install_dest RUNTIME DESTINATION bin)
+  install(TARGETS dxcompiler
+    RUNTIME DESTINATION bin COMPONENT dxcompiler
+    ARCHIVE DESTINATION lib COMPONENT dxcompiler)
 else()
-  set(install_dest LIBRARY DESTINATION lib${LLVM_LIBDIR_SUFFIX})
+  install(TARGETS dxcompiler
+    LIBRARY DESTINATION lib${LLVM_LIBDIR_SUFFIX} COMPONENT dxcompiler)
 endif()
-
-install(TARGETS dxcompiler
-  ${install_dest}
-  COMPONENT dxcompiler)
 
 add_custom_target(install-dxcompiler
   DEPENDS dxcompiler
   COMMAND "${CMAKE_COMMAND}"
           -DCMAKE_INSTALL_COMPONENT=dxcompiler
           -P "${CMAKE_BINARY_DIR}/cmake_install.cmake")
+
+if (WIN32 AND HLSL_INCLUDE_TESTS)
+  add_executable(radray_wire_probe
+    ${LLVM_MAIN_SRC_DIR}/utils/radray_wire_probe.cpp)
+  llvm_update_compile_flags(radray_wire_probe)
+  target_link_libraries(radray_wire_probe PRIVATE dxcompiler)
+  set_output_directory(radray_wire_probe
+    ${LLVM_RUNTIME_OUTPUT_INTDIR} ${LLVM_LIBRARY_OUTPUT_INTDIR})
+  set_target_properties(radray_wire_probe PROPERTIES FOLDER "Clang tests")
+endif()
