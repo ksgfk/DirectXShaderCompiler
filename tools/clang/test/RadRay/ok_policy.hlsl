@@ -20,7 +20,7 @@
 // CHECK-DAG: Output group=0 binding=3 kind=RWStructuredBuffer count=1 stages=0x2 placement=Table sampler=-1 flags=0x0 payload=none
 // CHECK-DAG: Points group=0 binding=4 kind=StructuredBuffer count=1 stages=0x2 placement=RootDescriptor sampler=-1 flags=0x0 payload=none
 // CHECK-DAG: LinearClamp group=0 binding=5 kind=Sampler count=1 stages=0x2 placement=Table sampler=0 flags=0x0 payload=none
-// CHECK-DAG: Push space=0 register=0 offset=0 size=16 stages=0x3 flags=0x0 payload=PushData
+// CHECK-DAG: Push space=0 register=0 offset=0 size=16 stages=0x2 flags=0x0 payload=PushData
 // CHECK-DAG: samplers (1):
 // CHECK-DAG: mag=1 min=1 mip=1 addr=2/3/0 bias=0.0 aniso=0/1.0 cmp=0/3 lod=0.0..8.0 border=4 reduction=0 flags=0x0
 

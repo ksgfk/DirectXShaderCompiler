@@ -2339,14 +2339,31 @@ void RadRayContractCollector::ApplyRootSignaturePolicy() {
                               "declares");
   }
 
-  // Root constants come from the policy, not from liveness, so both lanes
-  // publish the same records for a given stage. A parameter no declaration
-  // matches has no push handle and is skipped.
+  // DXIL preserves policy root constants even when unused. SPIR-V only
+  // publishes parameters observed in the current entry's active resources.
   for (const MetadataPolicyParameter &parameter : _policy) {
     if (parameter.Kind !=
             static_cast<uint32_t>(MetadataPolicyKind::RootConstants) ||
         (parameter.StageMask & stageBit) == 0u)
       continue;
+    if (_target == RadRayDxcTarget::SPIRV) {
+      const bool activePush = std::any_of(
+          observed.begin(), observed.end(),
+          [&](const MetadataRootConstantFact &fact) {
+            return fact.RegisterSpace == parameter.RegisterSpace &&
+                   fact.Register == parameter.BaseRegister;
+          });
+      const bool activeBinding = std::any_of(
+          observedBindings.begin(), observedBindings.end(),
+          [&](const MetadataBindingFact &binding) {
+            return binding.RegisterClass == 0u &&
+                   binding.HasDeclarationRegister &&
+                   binding.DeclarationRegisterSpace == parameter.RegisterSpace &&
+                   binding.DeclarationRegisterNumber == parameter.BaseRegister;
+          });
+      if (!activePush && !activeBinding)
+        continue;
+    }
     const MetadataDeclarationFact *declaration = nullptr;
     for (const MetadataDeclarationFact &candidate : _declarations)
       if (candidate.HasRegister &&
@@ -2857,7 +2874,7 @@ void RadRayContractCollector::CollectSpirvAction(clang::EmitSpirvAction &action,
     }
     const bool pushConstant =
         variable->getStorageClass() == spv::StorageClass::PushConstant;
-    if (!entryPointName.empty() && !pushConstant &&
+    if (!entryPointName.empty() &&
         std::find(activeResources.begin(), activeResources.end(), variable) ==
             activeResources.end())
       continue;

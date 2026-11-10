@@ -4,7 +4,7 @@
 
 #define RS "RootConstants(num32BitConstants=4, b0)"
 struct PushData { float4 Tint; };
-ConstantBuffer<PushData> Push : register(b0);
+[[vk::binding(0, 0)]] ConstantBuffer<PushData> Push : register(b0);
 
 struct VsOut { float4 Position : SV_Position; float2 Uv : TEXCOORD0; };
 
