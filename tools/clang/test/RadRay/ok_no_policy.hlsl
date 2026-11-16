@@ -1,7 +1,7 @@
 // RUN: %radray_probe %s 60 3 | FileCheck %s --check-prefix=CHECK --implicit-check-not=placement=RootDescriptor --implicit-check-not=placement=StaticSampler
 
-// CHECK-DAG: toolchain=0x0000000001090215
-// CHECK-DAG: toolchain=0x0000000001090215
+// CHECK-DAG: toolchain=0x0000000001090216
+// CHECK-DAG: toolchain=0x0000000001090216
 // CHECK-DAG: rootSignature=0 bytes
 // CHECK-DAG: A group=0 binding=0 kind=CBuffer count=1 stages=0x2 placement=Table sampler=-1 flags=0x0 payload=SceneData
 // CHECK-DAG: Raw group=0 binding=1 kind=RawBuffer count=1 stages=0x2 placement=Table sampler=-1 flags=0x0 payload=none

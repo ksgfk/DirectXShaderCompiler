@@ -1,11 +1,11 @@
 // RUN: %radray_probe %s 60 3 | FileCheck %s --check-prefix=CHECK
 
-// CHECK-DAG: toolchain=0x0000000001090215
-// CHECK-DAG: toolchain=0x0000000001090215
-// CHECK-DAG: schema=9 headerSize=152 total={{[0-9]+}} target=0 stageMask=0x3
+// CHECK-DAG: toolchain=0x0000000001090216
+// CHECK-DAG: toolchain=0x0000000001090216
+// CHECK-DAG: schema=10 headerSize=152 total={{[0-9]+}} target=0 stageMask=0x3
 // CHECK-DAG: Inner group=0 binding=0 kind=CBuffer count=1 stages=0x1 placement=Table sampler=-1 flags=0x0 payload=InnerRoot
 // CHECK-DAG: Outer group=0 binding=1 kind=CBuffer count=1 stages=0x2 placement=Table sampler=-1 flags=0x0 payload=OuterRoot
-// CHECK-DAG: schema=9 headerSize=152 total={{[0-9]+}} target=1 stageMask=0x3
+// CHECK-DAG: schema=10 headerSize=152 total={{[0-9]+}} target=1 stageMask=0x3
 // CHECK-DAG: Inner group=0 binding=6 kind=CBuffer count=1 stages=0x1 placement=Table sampler=-1 flags=0x0 payload=InnerRoot
 // CHECK-DAG: Outer group=0 binding=7 kind=CBuffer count=1 stages=0x2 placement=Table sampler=-1 flags=0x0 payload=OuterRoot
 // CHECK-DAG: metadata deterministic=yes

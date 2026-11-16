@@ -63,8 +63,10 @@
 #include <cstddef>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -91,10 +93,10 @@ using std::wstring;
 
 // Toolchain identity gates artifact trust on the RadRay side. Bump both values
 // together whenever compiler output semantics change, then regenerate goldens.
-constexpr uint8_t kToolchainIdentity[16] = {0x15, 0x02, 0x09, 0x01, 0x72, 0x61,
+constexpr uint8_t kToolchainIdentity[16] = {0x16, 0x02, 0x09, 0x01, 0x72, 0x61,
                                             0x64, 0x72, 0x61, 0x79, 0x2d, 0x31,
                                             0x2e, 0x39, 0x2e, 0x31};
-constexpr uint64_t kMetadataToolchainIdentity = 0x0000000001090215ull;
+constexpr uint64_t kMetadataToolchainIdentity = 0x0000000001090216ull;
 constexpr uint32_t kMetadataScalarNone = 0;
 constexpr uint32_t kMetadataScalarFloat = 1;
 constexpr uint32_t kMetadataScalarSint = 2;
@@ -3553,7 +3555,6 @@ bool CompileStage(const CompileRequest &request, RadRayDxcTarget target,
   return true;
 }
 
-#pragma pack(push, 1)
 struct WireRange {
   uint32_t Offset;
   uint32_t Size;
@@ -3573,7 +3574,7 @@ struct WireEnvelope {
   WireRange RootConstantRecords;
   WireRange VertexInputRecords;
   // Immutable sampler states in policy order, referenced by
-  // WireBindingRecord::SamplerIndex. Vulkan only.
+  // ShaderArtifactBindingRecord::SamplerIndex. Vulkan only.
   WireRange SamplerRecords;
   WireRange RootSignature;
   WireRange Bytecode;
@@ -3586,17 +3587,15 @@ struct WireEnvelope {
   uint8_t GpuArtifact[16];
 };
 
-struct WireEntryRecord {
+struct ShaderArtifactEntryRecord {
   WireRange Name;
   uint8_t Stage;
   uint8_t Flags;
-  uint16_t Reserved;
   uint32_t InterfaceOffset;
   uint32_t InterfaceSize;
-  uint32_t Reserved2;
 };
 
-struct WireBindingRecord {
+struct ShaderArtifactBindingRecord {
   WireRange Name;
   uint32_t Group;
   uint32_t Binding;
@@ -3615,7 +3614,7 @@ struct WireBindingRecord {
   uint32_t BufferByteSize;
 };
 
-struct WireTypeRecord {
+struct ShaderArtifactTypeRecord {
   WireRange Name;
   uint32_t ParentIndex;
   uint32_t Kind;
@@ -3634,7 +3633,7 @@ struct WireTypeRecord {
   uint32_t MatrixStride;
 };
 
-struct WireRootConstantRecord {
+struct ShaderArtifactRootConstantRecord {
   // Declaration name of the push block. The push handle table is keyed on it.
   WireRange Name;
   uint32_t RegisterSpace;
@@ -3650,7 +3649,7 @@ struct WireRootConstantRecord {
 
 // A static sampler state in Vulkan terms. Every field holds the official Vulkan
 // enumerant value, so the backend consumes it without a second mapping table.
-struct WireSamplerRecord {
+struct ShaderArtifactSamplerRecord {
   uint32_t MagFilter;
   uint32_t MinFilter;
   uint32_t MipmapMode;
@@ -3669,7 +3668,7 @@ struct WireSamplerRecord {
   uint32_t Flags;
 };
 
-struct WireVertexInputRecord {
+struct ShaderArtifactVertexInputRecord {
   WireRange Semantic;
   uint32_t SemanticIndex;
   uint32_t Location;
@@ -3677,19 +3676,200 @@ struct WireVertexInputRecord {
   uint32_t ComponentCount;
   uint32_t Flags;
 };
-#pragma pack(pop)
 
 static_assert(sizeof(WireEnvelope) == 152);
-static_assert(sizeof(WireEntryRecord) == 24);
-static_assert(sizeof(WireBindingRecord) == 48);
-static_assert(offsetof(WireBindingRecord, TypeIndex) == 40);
-static_assert(sizeof(WireTypeRecord) == 64);
-static_assert(offsetof(WireTypeRecord, ScalarKind) == 40);
-static_assert(sizeof(WireRootConstantRecord) == 36);
-static_assert(offsetof(WireRootConstantRecord, TypeIndex) == 32);
-static_assert(sizeof(WireSamplerRecord) == 64);
-static_assert(sizeof(WireVertexInputRecord) == 28);
 
+// Schema 10 records use explicit little-endian words, independent of host
+// struct layout.
+uint32_t MetadataU32(const uint8_t *data, size_t offset) {
+  uint32_t value = 0;
+  for (size_t i = 0; i < 4; ++i)
+    value |= uint32_t(data[offset + i]) << (i * 8);
+  return value;
+}
+uint32_t MetadataFloatBits(float value) {
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+uint32_t MetadataRecordSize(const ShaderArtifactEntryRecord &) { return 20; }
+bool EncodeMetadataRecord(const ShaderArtifactEntryRecord &record,
+                          vector<uint8_t> &output) {
+  if (record.Stage > 255u)
+    return false;
+  if (record.Flags > 0u)
+    return false;
+  AppendU32(output, record.Name.Offset);
+  AppendU32(output, record.Name.Size);
+  AppendU32(output, (uint32_t(record.Stage) << 0));
+  AppendU32(output, record.InterfaceOffset);
+  AppendU32(output, record.InterfaceSize);
+  return true;
+}
+uint32_t MetadataRecordSize(const ShaderArtifactBindingRecord &) { return 36; }
+bool EncodeMetadataRecord(const ShaderArtifactBindingRecord &record,
+                          vector<uint8_t> &output) {
+  if (record.Type > 15u)
+    return false;
+  if (record.StageMask > 7u)
+    return false;
+  if (record.Placement > 3u)
+    return false;
+  if (record.Flags > 0u)
+    return false;
+  AppendU32(output, record.Name.Offset);
+  AppendU32(output, record.Name.Size);
+  AppendU32(output, record.Group);
+  AppendU32(output, record.Binding);
+  AppendU32(output, (uint32_t(record.Type) << 0) |
+                        (uint32_t(record.StageMask) << 4) |
+                        (uint32_t(record.Placement) << 7));
+  AppendU32(output, record.Count);
+  AppendU32(output, record.SamplerIndex);
+  AppendU32(output, record.TypeIndex);
+  AppendU32(output, record.BufferByteSize);
+  return true;
+}
+uint32_t MetadataRecordSize(const ShaderArtifactTypeRecord &) { return 44; }
+bool EncodeMetadataRecord(const ShaderArtifactTypeRecord &record,
+                          vector<uint8_t> &output) {
+  if (record.Kind > 7u)
+    return false;
+  if (record.ElementKind > 7u)
+    return false;
+  if (record.ScalarKind > 7u)
+    return false;
+  if (record.RowCount > 7u)
+    return false;
+  if (record.ColumnCount > 7u)
+    return false;
+  if (record.Flags > 1u)
+    return false;
+  AppendU32(output, record.Name.Offset);
+  AppendU32(output, record.Name.Size);
+  AppendU32(output, record.ParentIndex);
+  AppendU32(output, (uint32_t(record.Kind) << 0) |
+                        (uint32_t(record.ElementKind) << 3) |
+                        (uint32_t(record.ScalarKind) << 6) |
+                        (uint32_t(record.RowCount) << 9) |
+                        (uint32_t(record.ColumnCount) << 12) |
+                        (uint32_t(record.Flags) << 15));
+  AppendU32(output, record.ElementCount);
+  AppendU32(output, record.Offset);
+  AppendU32(output, record.Size);
+  AppendU32(output, record.Stride);
+  AppendU32(output, record.TypeIndex);
+  AppendU32(output, record.ElementSize);
+  AppendU32(output, record.MatrixStride);
+  return true;
+}
+bool DecodeMetadataType(const uint8_t *input,
+                        ShaderArtifactTypeRecord &record) {
+  record.Name.Offset = MetadataU32(input, 0);
+  record.Name.Size = MetadataU32(input, 4);
+  record.ParentIndex = MetadataU32(input, 8);
+  const uint32_t packed = MetadataU32(input, 12);
+  if (packed & ~65535u)
+    return false;
+  record.Kind = (packed >> 0) & 7u;
+  record.ElementKind = (packed >> 3) & 7u;
+  record.ScalarKind = (packed >> 6) & 7u;
+  record.RowCount = (packed >> 9) & 7u;
+  record.ColumnCount = (packed >> 12) & 7u;
+  record.Flags = (packed >> 15) & 1u;
+  record.ElementCount = MetadataU32(input, 16);
+  record.Offset = MetadataU32(input, 20);
+  record.Size = MetadataU32(input, 24);
+  record.Stride = MetadataU32(input, 28);
+  record.TypeIndex = MetadataU32(input, 32);
+  record.ElementSize = MetadataU32(input, 36);
+  record.MatrixStride = MetadataU32(input, 40);
+  return true;
+}
+uint32_t MetadataRecordSize(const ShaderArtifactRootConstantRecord &) {
+  return 32;
+}
+bool EncodeMetadataRecord(const ShaderArtifactRootConstantRecord &record,
+                          vector<uint8_t> &output) {
+  if (record.StageMask > 7u)
+    return false;
+  if (record.Flags > 1u)
+    return false;
+  AppendU32(output, record.Name.Offset);
+  AppendU32(output, record.Name.Size);
+  AppendU32(output, record.RegisterSpace);
+  AppendU32(output, record.Register);
+  AppendU32(output, record.Offset);
+  AppendU32(output, record.Size);
+  AppendU32(output, (uint32_t(record.StageMask) << 0) | (record.Flags << 3));
+  AppendU32(output, record.TypeIndex);
+  return true;
+}
+uint32_t MetadataRecordSize(const ShaderArtifactVertexInputRecord &) {
+  return 20;
+}
+bool EncodeMetadataRecord(const ShaderArtifactVertexInputRecord &record,
+                          vector<uint8_t> &output) {
+  if (record.ComponentType > 3u)
+    return false;
+  if (record.ComponentCount > 7u)
+    return false;
+  if (record.Flags > 0u)
+    return false;
+  AppendU32(output, record.Semantic.Offset);
+  AppendU32(output, record.Semantic.Size);
+  AppendU32(output, record.SemanticIndex);
+  AppendU32(output, record.Location);
+  AppendU32(output, (uint32_t(record.ComponentType) << 0) |
+                        (uint32_t(record.ComponentCount) << 2));
+  return true;
+}
+uint32_t MetadataRecordSize(const ShaderArtifactSamplerRecord &) { return 20; }
+bool EncodeMetadataRecord(const ShaderArtifactSamplerRecord &record,
+                          vector<uint8_t> &output) {
+  if (record.MagFilter > 1u)
+    return false;
+  if (record.MinFilter > 1u)
+    return false;
+  if (record.MipmapMode > 1u)
+    return false;
+  if (record.AddressModeU > 7u)
+    return false;
+  if (record.AddressModeV > 7u)
+    return false;
+  if (record.AddressModeW > 7u)
+    return false;
+  if (record.AnisotropyEnable > 1u)
+    return false;
+  if (record.CompareEnable > 1u)
+    return false;
+  if (record.CompareOp > 7u)
+    return false;
+  if (record.BorderColor > 7u)
+    return false;
+  if (record.ReductionMode > 3u)
+    return false;
+  if (record.Flags > 1u)
+    return false;
+  AppendU32(output, (uint32_t(record.MagFilter) << 0) |
+                        (uint32_t(record.MinFilter) << 1) |
+                        (uint32_t(record.MipmapMode) << 2) |
+                        (uint32_t(record.AddressModeU) << 3) |
+                        (uint32_t(record.AddressModeV) << 6) |
+                        (uint32_t(record.AddressModeW) << 9) |
+                        (uint32_t(record.AnisotropyEnable) << 12) |
+                        (uint32_t(record.CompareEnable) << 13) |
+                        (uint32_t(record.CompareOp) << 14) |
+                        (uint32_t(record.BorderColor) << 17) |
+                        (uint32_t(record.ReductionMode) << 20) |
+                        (uint32_t(record.Flags) << 22));
+  AppendU32(output, MetadataFloatBits(record.MipLodBias));
+  AppendU32(output, MetadataFloatBits(record.MaxAnisotropy));
+  AppendU32(output, MetadataFloatBits(record.MinLod));
+  AppendU32(output, MetadataFloatBits(record.MaxLod));
+  return true;
+}
 string WireName(const vector<uint8_t> &blob, WireRange range) {
   if (range.Offset > blob.size() || range.Size > blob.size() - range.Offset)
     return {};
@@ -3729,7 +3909,7 @@ struct TypePayloadRoot {
 };
 
 void CopyTypeShape(TypePayloadField &field,
-                   const WireTypeRecord &record) noexcept {
+                   const ShaderArtifactTypeRecord &record) noexcept {
   field.Kind = record.Kind;
   field.ElementCount = record.ElementCount;
   field.Offset = record.Offset;
@@ -3761,19 +3941,20 @@ bool SameTypePayloadField(const TypePayloadField &left,
 
 bool ReadTypePayloads(const vector<uint8_t> &metadata,
                       vector<TypePayloadRoot> &roots) {
-  if (metadata.size() < sizeof(WireEnvelope))
+  if (metadata.size() < 152)
     return false;
-  WireEnvelope envelope{};
-  std::memcpy(&envelope, metadata.data(), sizeof(envelope));
-  if (envelope.TypeRecords.Size % sizeof(WireTypeRecord) != 0 ||
-      envelope.TypeRecords.Offset > metadata.size() ||
-      envelope.TypeRecords.Size > metadata.size() - envelope.TypeRecords.Offset)
+  const WireRange range{MetadataU32(metadata.data(), 32),
+                        MetadataU32(metadata.data(), 36)};
+  const uint32_t stride = MetadataRecordSize(ShaderArtifactTypeRecord{});
+  if (range.Size % stride || range.Offset > metadata.size() ||
+      range.Size > metadata.size() - range.Offset)
     return false;
-  const uint32_t count = envelope.TypeRecords.Size / sizeof(WireTypeRecord);
-  vector<WireTypeRecord> types(count);
-  if (count != 0)
-    std::memcpy(types.data(), metadata.data() + envelope.TypeRecords.Offset,
-                envelope.TypeRecords.Size);
+  const uint32_t count = range.Size / stride;
+  vector<ShaderArtifactTypeRecord> types(count);
+  for (uint32_t index = 0; index < count; ++index)
+    if (!DecodeMetadataType(metadata.data() + range.Offset + index * stride,
+                            types[index]))
+      return false;
   for (uint32_t index = 0; index < count; ++index) {
     if (types[index].ParentIndex != kMetadataNoParent)
       continue;
@@ -4071,6 +4252,101 @@ bool MergeMetadataFacts(const ContractData &contract, RadRayDxcTarget target,
   return true;
 }
 
+template <typename T>
+vector<const T *> MetadataByName(const vector<T> &values) {
+  vector<const T *> sorted;
+  for (const auto &value : values)
+    sorted.push_back(&value);
+  std::sort(sorted.begin(), sorted.end(),
+            [](const T *a, const T *b) { return a->Name < b->Name; });
+  return sorted;
+}
+
+vector<uint8_t> CanonicalGpuInterface(const ContractData &contract,
+                                      const MetadataFacts &facts) {
+  vector<uint8_t> bytes;
+  AppendString(bytes, "RadRay.GPU.Interface");
+  AppendU32(
+      bytes,
+      1); // Canonical interface encoding version, independent of wire schema.
+  AppendByte(bytes, facts.HasRootSignature ? 1u : 0u);
+  if (facts.HasRootSignature)
+    for (uint8_t b : facts.RootSignatureHash.Bytes)
+      AppendByte(bytes, b);
+  AppendU32(bytes, static_cast<uint32_t>(contract.EntryPoints.size()));
+  for (const auto *e : MetadataByName(contract.EntryPoints)) {
+    AppendString(bytes, e->Name);
+    AppendByte(bytes, static_cast<uint8_t>(e->Stage));
+  }
+  AppendU32(bytes, static_cast<uint32_t>(facts.Bindings.size()));
+  for (const auto *b : MetadataByName(facts.Bindings)) {
+    AppendString(bytes, b->Name);
+    for (uint32_t v :
+         {b->Group, b->Binding, b->Type, b->Count, b->StageMask, b->Placement})
+      AppendU32(bytes, v);
+    const bool immutable = b->SamplerIndex != kMetadataNoSampler;
+    AppendByte(bytes, immutable ? 1u : 0u);
+    if (immutable) {
+      const auto &state = facts.Samplers[b->SamplerIndex];
+      for (uint32_t v :
+           {state.MagFilter, state.MinFilter, state.MipmapMode,
+            state.AddressModeU, state.AddressModeV, state.AddressModeW,
+            MetadataFloatBits(state.MipLodBias), state.AnisotropyEnable,
+            MetadataFloatBits(state.MaxAnisotropy), state.CompareEnable,
+            state.CompareOp, MetadataFloatBits(state.MinLod),
+            MetadataFloatBits(state.MaxLod), state.BorderColor,
+            state.ReductionMode, state.Flags})
+        AppendU32(bytes, v);
+    }
+  }
+  AppendU32(bytes, static_cast<uint32_t>(facts.RootConstants.size()));
+  for (const auto *p : MetadataByName(facts.RootConstants)) {
+    AppendString(bytes, p->Name);
+    for (uint32_t v : {p->RegisterSpace, p->Register, p->Offset, p->Size,
+                       p->StageMask, p->Flags})
+      AppendU32(bytes, v);
+  }
+  vector<const MetadataVertexInputFact *> vertices;
+  for (const auto &v : facts.VertexInputs)
+    vertices.push_back(&v);
+  std::sort(
+      vertices.begin(), vertices.end(),
+      [](const MetadataVertexInputFact *a, const MetadataVertexInputFact *b) {
+        return std::tie(a->Location, a->Semantic, a->SemanticIndex) <
+               std::tie(b->Location, b->Semantic, b->SemanticIndex);
+      });
+  AppendU32(bytes, static_cast<uint32_t>(vertices.size()));
+  for (const auto *v : vertices) {
+    AppendString(bytes, v->Semantic);
+    for (uint32_t n :
+         {v->SemanticIndex, v->Location, v->ComponentType, v->ComponentCount})
+      AppendU32(bytes, n);
+  }
+  return bytes;
+}
+
+void EncodeMetadataEnvelope(const WireEnvelope &e, vector<uint8_t> &output) {
+  AppendU32(output, e.Magic);
+  AppendU16(output, e.SchemaVersion);
+  AppendU16(output, e.HeaderSize);
+  AppendU32(output, e.TotalSize);
+  AppendByte(output, e.Target);
+  AppendByte(output, e.StageMask);
+  AppendU16(output, e.Flags);
+  for (const auto &range :
+       {e.EntryRecords, e.BindingRecords, e.TypeRecords, e.RootConstantRecords,
+        e.VertexInputRecords, e.SamplerRecords, e.RootSignature, e.Bytecode}) {
+    AppendU32(output, range.Offset);
+    AppendU32(output, range.Size);
+  }
+  AppendU32(output, static_cast<uint32_t>(e.ToolchainIdentity));
+  AppendU32(output, static_cast<uint32_t>(e.ToolchainIdentity >> 32));
+  for (const auto *hash : {e.Contract, e.BytecodeDigest,
+                           e.BasePipelineLayoutDigest, e.GpuArtifact})
+    for (size_t i = 0; i < 16; ++i)
+      AppendByte(output, hash[i]);
+}
+
 bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
                    RadRayDxcTarget target, const vector<StageOutput> &stages,
                    vector<Diagnostic> &diagnostics, vector<uint8_t> &metadata) {
@@ -4083,6 +4359,12 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
            facts.Types[typeIndex].Kind == 4u;
   };
   for (const MetadataBindingFact &binding : facts.Bindings) {
+    if (binding.SamplerIndex != kMetadataNoSampler &&
+        binding.SamplerIndex >= facts.Samplers.size()) {
+      diagnostics.push_back(
+          {2125, "resource binding has an invalid sampler reference"});
+      return false;
+    }
     const bool cbuffer =
         binding.Type == static_cast<uint32_t>(MetadataBindingKind::CBuffer);
     if ((cbuffer && !isRootStruct(binding.TypeIndex)) ||
@@ -4103,85 +4385,105 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
     }
   }
 
-  const uint32_t entryOffset = sizeof(WireEnvelope);
-  const uint32_t entryBytes = static_cast<uint32_t>(
-      contract.EntryPoints.size() * sizeof(WireEntryRecord));
-  const uint32_t bindingOffset = entryOffset + entryBytes;
-  const uint32_t bindingBytes =
-      static_cast<uint32_t>(facts.Bindings.size() * sizeof(WireBindingRecord));
-  const uint32_t typeOffset = bindingOffset + bindingBytes;
-  const uint32_t typeBytes =
-      static_cast<uint32_t>(facts.Types.size() * sizeof(WireTypeRecord));
-  const uint32_t rootConstantOffset = typeOffset + typeBytes;
-  const uint32_t rootConstantBytes = static_cast<uint32_t>(
-      facts.RootConstants.size() * sizeof(WireRootConstantRecord));
-  const uint32_t vertexInputOffset = rootConstantOffset + rootConstantBytes;
-  const uint32_t vertexInputBytes = static_cast<uint32_t>(
-      facts.VertexInputs.size() * sizeof(WireVertexInputRecord));
-  const uint32_t samplerOffset = vertexInputOffset + vertexInputBytes;
-  const uint32_t samplerBytes =
-      static_cast<uint32_t>(facts.Samplers.size() * sizeof(WireSamplerRecord));
-  const uint32_t nameOffset = samplerOffset + samplerBytes;
-  uint32_t nameBytes = 0;
-  for (const EntryPoint &entry : contract.EntryPoints)
-    nameBytes += static_cast<uint32_t>(entry.Name.size());
-  for (const MetadataBindingFact &binding : facts.Bindings)
-    nameBytes += static_cast<uint32_t>(binding.Name.size());
-  for (const MetadataTypeFact &type : facts.Types)
-    nameBytes += static_cast<uint32_t>(type.Name.size());
-  for (const MetadataRootConstantFact &constant : facts.RootConstants)
-    nameBytes += static_cast<uint32_t>(constant.Name.size());
-  for (const MetadataVertexInputFact &input : facts.VertexInputs)
-    nameBytes += static_cast<uint32_t>(input.Semantic.size());
-  const uint32_t rootSignatureOffset = nameOffset + nameBytes;
-  const uint32_t rootSignatureSize =
-      static_cast<uint32_t>(facts.SerializedRootSignature.size());
-  const uint32_t bytecodeOffset = rootSignatureOffset + rootSignatureSize;
-  uint32_t bytecodeSize = 0;
-  for (const StageOutput &stage : stages)
-    bytecodeSize += static_cast<uint32_t>(stage.Bytecode.size());
-
+  const uint64_t entryOffset = 152;
+  const uint64_t entryBytes = uint64_t(contract.EntryPoints.size()) *
+                              MetadataRecordSize(ShaderArtifactEntryRecord{});
+  const uint64_t bindingOffset = entryOffset + entryBytes;
+  const uint64_t bindingBytes =
+      uint64_t(facts.Bindings.size()) *
+      MetadataRecordSize(ShaderArtifactBindingRecord{});
+  const uint64_t typeOffset = bindingOffset + bindingBytes;
+  const uint64_t typeBytes = uint64_t(facts.Types.size()) *
+                             MetadataRecordSize(ShaderArtifactTypeRecord{});
+  const uint64_t rootConstantOffset = typeOffset + typeBytes;
+  const uint64_t rootConstantBytes =
+      uint64_t(facts.RootConstants.size()) *
+      MetadataRecordSize(ShaderArtifactRootConstantRecord{});
+  const uint64_t vertexInputOffset = rootConstantOffset + rootConstantBytes;
+  const uint64_t vertexInputBytes =
+      uint64_t(facts.VertexInputs.size()) *
+      MetadataRecordSize(ShaderArtifactVertexInputRecord{});
+  const uint64_t samplerOffset = vertexInputOffset + vertexInputBytes;
+  const uint64_t samplerBytes =
+      uint64_t(facts.Samplers.size()) *
+      MetadataRecordSize(ShaderArtifactSamplerRecord{});
+  const uint64_t nameOffset = samplerOffset + samplerBytes;
+  std::map<string, WireRange> names;
+  for (const auto &v : contract.EntryPoints)
+    names.emplace(v.Name, WireRange{});
+  for (const auto &v : facts.Bindings)
+    names.emplace(v.Name, WireRange{});
+  for (const auto &v : facts.Types)
+    names.emplace(v.Name, WireRange{});
+  for (const auto &v : facts.RootConstants)
+    names.emplace(v.Name, WireRange{});
+  for (const auto &v : facts.VertexInputs)
+    names.emplace(v.Semantic, WireRange{});
+  uint64_t nameBytes = 0;
+  for (const auto &name : names)
+    nameBytes += name.first.size();
+  const uint64_t rootSignatureOffset = nameOffset + nameBytes;
+  const uint64_t rootSignatureSize = facts.SerializedRootSignature.size();
+  const uint64_t bytecodeOffset = rootSignatureOffset + rootSignatureSize;
+  uint64_t bytecodeSize = 0;
+  for (const auto &stage : stages)
+    bytecodeSize += stage.Bytecode.size();
+  if (bytecodeOffset + bytecodeSize > std::numeric_limits<uint32_t>::max()) {
+    diagnostics.push_back({2125, "metadata exceeds 32-bit wire ranges"});
+    return false;
+  }
+  uint32_t currentNameOffset = static_cast<uint32_t>(nameOffset);
+  for (auto &name : names) {
+    name.second = {currentNameOffset, static_cast<uint32_t>(name.first.size())};
+    currentNameOffset += name.second.Size;
+  }
   WireEnvelope envelope{};
   envelope.Magic = radray::shader::kRadRayDxcShaderWireMagic;
   envelope.SchemaVersion = radray::shader::kRadRayDxcMetadataSchemaVersion;
-  envelope.HeaderSize = sizeof(WireEnvelope);
-  envelope.TotalSize = bytecodeOffset + bytecodeSize;
+  envelope.HeaderSize = 152;
+  envelope.TotalSize = static_cast<uint32_t>(bytecodeOffset + bytecodeSize);
   envelope.Target = target == RadRayDxcTarget::DXIL ? 0 : 1;
-  envelope.EntryRecords = {entryOffset, entryBytes};
-  envelope.BindingRecords = {bindingOffset, bindingBytes};
-  envelope.TypeRecords = {typeOffset, typeBytes};
-  envelope.RootConstantRecords = {rootConstantOffset, rootConstantBytes};
-  envelope.VertexInputRecords = {vertexInputOffset, vertexInputBytes};
-  envelope.SamplerRecords = {samplerOffset, samplerBytes};
-  envelope.RootSignature = {rootSignatureOffset, rootSignatureSize};
-  envelope.Bytecode = {bytecodeOffset, bytecodeSize};
+  envelope.EntryRecords = {static_cast<uint32_t>(entryOffset),
+                           static_cast<uint32_t>(entryBytes)};
+  envelope.BindingRecords = {static_cast<uint32_t>(bindingOffset),
+                             static_cast<uint32_t>(bindingBytes)};
+  envelope.TypeRecords = {static_cast<uint32_t>(typeOffset),
+                          static_cast<uint32_t>(typeBytes)};
+  envelope.RootConstantRecords = {static_cast<uint32_t>(rootConstantOffset),
+                                  static_cast<uint32_t>(rootConstantBytes)};
+  envelope.VertexInputRecords = {static_cast<uint32_t>(vertexInputOffset),
+                                 static_cast<uint32_t>(vertexInputBytes)};
+  envelope.SamplerRecords = {static_cast<uint32_t>(samplerOffset),
+                             static_cast<uint32_t>(samplerBytes)};
+  envelope.RootSignature = {static_cast<uint32_t>(rootSignatureOffset),
+                            static_cast<uint32_t>(rootSignatureSize)};
+  envelope.Bytecode = {static_cast<uint32_t>(bytecodeOffset),
+                       static_cast<uint32_t>(bytecodeSize)};
   envelope.ToolchainIdentity = kMetadataToolchainIdentity;
   std::memcpy(envelope.Contract, contract.Hash.Bytes,
               sizeof(envelope.Contract));
 
-  vector<WireEntryRecord> entries;
+  vector<ShaderArtifactEntryRecord> entries;
   entries.reserve(contract.EntryPoints.size());
-  uint32_t currentNameOffset = nameOffset;
   uint32_t currentInterfaceOffset = 0;
   for (size_t index = 0; index < contract.EntryPoints.size(); ++index) {
     const EntryPoint &entry = contract.EntryPoints[index];
-    WireEntryRecord record{};
-    record.Name = {currentNameOffset, static_cast<uint32_t>(entry.Name.size())};
+    ShaderArtifactEntryRecord record{};
+    record.Name = names.find(entry.Name)->second;
     record.Stage = static_cast<uint8_t>(entry.Stage);
     record.InterfaceOffset = currentInterfaceOffset;
     record.InterfaceSize = static_cast<uint32_t>(stages[index].Bytecode.size());
-    currentNameOffset += static_cast<uint32_t>(entry.Name.size());
     currentInterfaceOffset += record.InterfaceSize;
     entries.push_back(record);
     envelope.StageMask |=
         static_cast<uint8_t>(1u << static_cast<uint8_t>(entry.Stage));
   }
 
-  vector<WireBindingRecord> bindings;
+  vector<ShaderArtifactBindingRecord> bindings;
   bindings.reserve(facts.Bindings.size());
   for (const MetadataBindingFact &fact : facts.Bindings) {
-    WireBindingRecord record{};
-    record.Name = {currentNameOffset, static_cast<uint32_t>(fact.Name.size())};
+    ShaderArtifactBindingRecord record{};
+    record.Name = names.find(fact.Name)->second;
     record.Group = fact.Group;
     record.Binding = fact.Binding;
     record.Type = fact.Type;
@@ -4193,14 +4495,13 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
     record.TypeIndex = fact.TypeIndex;
     record.BufferByteSize = fact.BufferByteSize;
     bindings.push_back(record);
-    currentNameOffset += static_cast<uint32_t>(fact.Name.size());
   }
 
-  vector<WireTypeRecord> types;
+  vector<ShaderArtifactTypeRecord> types;
   types.reserve(facts.Types.size());
   for (const MetadataTypeFact &fact : facts.Types) {
-    WireTypeRecord record{};
-    record.Name = {currentNameOffset, static_cast<uint32_t>(fact.Name.size())};
+    ShaderArtifactTypeRecord record{};
+    record.Name = names.find(fact.Name)->second;
     record.ParentIndex = fact.ParentIndex;
     record.Kind = fact.Kind;
     record.ElementCount = fact.ElementCount;
@@ -4216,14 +4517,13 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
     record.ElementSize = fact.ElementSize;
     record.MatrixStride = fact.MatrixStride;
     types.push_back(record);
-    currentNameOffset += static_cast<uint32_t>(fact.Name.size());
   }
 
-  vector<WireRootConstantRecord> rootConstants;
+  vector<ShaderArtifactRootConstantRecord> rootConstants;
   rootConstants.reserve(facts.RootConstants.size());
   for (const MetadataRootConstantFact &fact : facts.RootConstants) {
-    WireRootConstantRecord record{};
-    record.Name = {currentNameOffset, static_cast<uint32_t>(fact.Name.size())};
+    ShaderArtifactRootConstantRecord record{};
+    record.Name = names.find(fact.Name)->second;
     record.RegisterSpace = fact.RegisterSpace;
     record.Register = fact.Register;
     record.Offset = fact.Offset;
@@ -4232,28 +4532,25 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
     record.Flags = fact.Flags;
     record.TypeIndex = fact.TypeIndex;
     rootConstants.push_back(record);
-    currentNameOffset += static_cast<uint32_t>(fact.Name.size());
   }
 
-  vector<WireVertexInputRecord> vertexInputs;
+  vector<ShaderArtifactVertexInputRecord> vertexInputs;
   vertexInputs.reserve(facts.VertexInputs.size());
   for (const MetadataVertexInputFact &fact : facts.VertexInputs) {
-    WireVertexInputRecord record{};
-    record.Semantic = {currentNameOffset,
-                       static_cast<uint32_t>(fact.Semantic.size())};
+    ShaderArtifactVertexInputRecord record{};
+    record.Semantic = names.find(fact.Semantic)->second;
     record.SemanticIndex = fact.SemanticIndex;
     record.Location = fact.Location;
     record.ComponentType = fact.ComponentType;
     record.ComponentCount = fact.ComponentCount;
     record.Flags = fact.Flags;
     vertexInputs.push_back(record);
-    currentNameOffset += static_cast<uint32_t>(fact.Semantic.size());
   }
 
-  vector<WireSamplerRecord> samplers;
+  vector<ShaderArtifactSamplerRecord> samplers;
   samplers.reserve(facts.Samplers.size());
   for (const MetadataSamplerFact &fact : facts.Samplers) {
-    WireSamplerRecord record{};
+    ShaderArtifactSamplerRecord record{};
     record.MagFilter = fact.MagFilter;
     record.MinFilter = fact.MinFilter;
     record.MipmapMode = fact.MipmapMode;
@@ -4273,45 +4570,7 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
     samplers.push_back(record);
   }
 
-  envelope.TotalSize = bytecodeOffset + bytecodeSize;
-  vector<uint8_t> layoutBytes;
-  layoutBytes.reserve(bindingBytes + rootConstantBytes + vertexInputBytes +
-                      nameBytes);
-  AppendByte(layoutBytes, facts.HasRootSignature ? 1u : 0u);
-  if (facts.HasRootSignature)
-    for (const uint8_t value : facts.RootSignatureHash.Bytes)
-      AppendByte(layoutBytes, value);
-  for (const WireBindingRecord &binding : bindings) {
-    const auto *data = reinterpret_cast<const uint8_t *>(&binding);
-    layoutBytes.insert(layoutBytes.end(), data,
-                       data + offsetof(WireBindingRecord, TypeIndex));
-  }
-  for (const WireRootConstantRecord &constant : rootConstants) {
-    const auto *data = reinterpret_cast<const uint8_t *>(&constant);
-    layoutBytes.insert(layoutBytes.end(), data,
-                       data + offsetof(WireRootConstantRecord, TypeIndex));
-  }
-  if (!vertexInputs.empty()) {
-    const auto *data = reinterpret_cast<const uint8_t *>(vertexInputs.data());
-    layoutBytes.insert(layoutBytes.end(), data, data + vertexInputBytes);
-  }
-  if (!samplers.empty()) {
-    const auto *data = reinterpret_cast<const uint8_t *>(samplers.data());
-    layoutBytes.insert(layoutBytes.end(), data, data + samplerBytes);
-  }
-  for (const EntryPoint &entry : contract.EntryPoints)
-    layoutBytes.insert(layoutBytes.end(), entry.Name.begin(), entry.Name.end());
-  for (const MetadataBindingFact &binding : facts.Bindings)
-    layoutBytes.insert(layoutBytes.end(), binding.Name.begin(),
-                       binding.Name.end());
-  for (const MetadataTypeFact &type : facts.Types)
-    layoutBytes.insert(layoutBytes.end(), type.Name.begin(), type.Name.end());
-  for (const MetadataRootConstantFact &constant : facts.RootConstants)
-    layoutBytes.insert(layoutBytes.end(), constant.Name.begin(),
-                       constant.Name.end());
-  for (const MetadataVertexInputFact &input : facts.VertexInputs)
-    layoutBytes.insert(layoutBytes.end(), input.Semantic.begin(),
-                       input.Semantic.end());
+  const vector<uint8_t> layoutBytes = CanonicalGpuInterface(contract, facts);
   const Hash128 bytecodeHash = [&]() {
     vector<uint8_t> bytes;
     bytes.reserve(bytecodeSize);
@@ -4332,59 +4591,57 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
   std::memcpy(envelope.GpuArtifact, gpuHash.Bytes,
               sizeof(envelope.GpuArtifact));
 
-  metadata.assign(envelope.TotalSize, 0);
-  std::memcpy(metadata.data(), &envelope, sizeof(envelope));
-  if (!entries.empty())
-    std::memcpy(metadata.data() + entryOffset, entries.data(), entryBytes);
-  if (!bindings.empty())
-    std::memcpy(metadata.data() + bindingOffset, bindings.data(), bindingBytes);
-  if (!types.empty())
-    std::memcpy(metadata.data() + typeOffset, types.data(), typeBytes);
-  if (!rootConstants.empty())
-    std::memcpy(metadata.data() + rootConstantOffset, rootConstants.data(),
-                rootConstantBytes);
-  if (!vertexInputs.empty())
-    std::memcpy(metadata.data() + vertexInputOffset, vertexInputs.data(),
-                vertexInputBytes);
-  if (!samplers.empty())
-    std::memcpy(metadata.data() + samplerOffset, samplers.data(), samplerBytes);
-  currentNameOffset = nameOffset;
-  for (const EntryPoint &entry : contract.EntryPoints) {
-    std::memcpy(metadata.data() + currentNameOffset, entry.Name.data(),
-                entry.Name.size());
-    currentNameOffset += static_cast<uint32_t>(entry.Name.size());
-  }
-  for (const MetadataBindingFact &binding : facts.Bindings) {
-    std::memcpy(metadata.data() + currentNameOffset, binding.Name.data(),
-                binding.Name.size());
-    currentNameOffset += static_cast<uint32_t>(binding.Name.size());
-  }
-  for (const MetadataTypeFact &type : facts.Types) {
-    std::memcpy(metadata.data() + currentNameOffset, type.Name.data(),
-                type.Name.size());
-    currentNameOffset += static_cast<uint32_t>(type.Name.size());
-  }
-  for (const MetadataRootConstantFact &constant : facts.RootConstants) {
-    std::memcpy(metadata.data() + currentNameOffset, constant.Name.data(),
-                constant.Name.size());
-    currentNameOffset += static_cast<uint32_t>(constant.Name.size());
-  }
-  for (const MetadataVertexInputFact &input : facts.VertexInputs) {
-    std::memcpy(metadata.data() + currentNameOffset, input.Semantic.data(),
-                input.Semantic.size());
-    currentNameOffset += static_cast<uint32_t>(input.Semantic.size());
-  }
-  if (!facts.SerializedRootSignature.empty()) {
-    std::memcpy(metadata.data() + rootSignatureOffset,
-                facts.SerializedRootSignature.data(),
-                facts.SerializedRootSignature.size());
-  }
-  uint32_t currentBytecodeOffset = bytecodeOffset;
-  for (const StageOutput &stage : stages) {
-    std::memcpy(metadata.data() + currentBytecodeOffset, stage.Bytecode.data(),
-                stage.Bytecode.size());
-    currentBytecodeOffset += static_cast<uint32_t>(stage.Bytecode.size());
-  }
+  vector<uint8_t> encoded;
+  encoded.reserve(envelope.TotalSize);
+  EncodeMetadataEnvelope(envelope, encoded);
+  for (const auto &record : entries)
+    if (!EncodeMetadataRecord(record, encoded)) {
+      diagnostics.push_back(
+          {2125,
+           "metadata field exceeds its wire range or uses reserved bits"});
+      return false;
+    }
+  for (const auto &record : bindings)
+    if (!EncodeMetadataRecord(record, encoded)) {
+      diagnostics.push_back(
+          {2125,
+           "metadata field exceeds its wire range or uses reserved bits"});
+      return false;
+    }
+  for (const auto &record : types)
+    if (!EncodeMetadataRecord(record, encoded)) {
+      diagnostics.push_back(
+          {2125,
+           "metadata field exceeds its wire range or uses reserved bits"});
+      return false;
+    }
+  for (const auto &record : rootConstants)
+    if (!EncodeMetadataRecord(record, encoded)) {
+      diagnostics.push_back(
+          {2125,
+           "metadata field exceeds its wire range or uses reserved bits"});
+      return false;
+    }
+  for (const auto &record : vertexInputs)
+    if (!EncodeMetadataRecord(record, encoded)) {
+      diagnostics.push_back(
+          {2125,
+           "metadata field exceeds its wire range or uses reserved bits"});
+      return false;
+    }
+  for (const auto &record : samplers)
+    if (!EncodeMetadataRecord(record, encoded)) {
+      diagnostics.push_back(
+          {2125,
+           "metadata field exceeds its wire range or uses reserved bits"});
+      return false;
+    }
+  for (const auto &name : names)
+    encoded.insert(encoded.end(), name.first.begin(), name.first.end());
+  AppendBytes(encoded, facts.SerializedRootSignature);
+  for (const auto &stage : stages)
+    AppendBytes(encoded, stage.Bytecode);
+  metadata = std::move(encoded);
   return true;
 }
 

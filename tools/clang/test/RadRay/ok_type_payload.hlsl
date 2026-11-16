@@ -1,9 +1,9 @@
 // RUN: %radray_probe %s 60 3 | FileCheck %s --check-prefix=CHECK
 
-// CHECK-DAG: toolchain=0x0000000001090215
-// CHECK-DAG: toolchain=0x0000000001090215
-// CHECK-DAG: schema=9 headerSize=152 total={{[0-9]+}} target=0 stageMask=0x4
-// CHECK-DAG: schema=9 headerSize=152 total={{[0-9]+}} target=1 stageMask=0x4
+// CHECK-DAG: toolchain=0x0000000001090216
+// CHECK-DAG: toolchain=0x0000000001090216
+// CHECK-DAG: schema=10 headerSize=152 total={{[0-9]+}} target=0 stageMask=0x4
+// CHECK-DAG: schema=10 headerSize=152 total={{[0-9]+}} target=1 stageMask=0x4
 // CHECK-DAG: Payload group=0 binding=0 kind=CBuffer count=1 stages=0x4 placement=Table sampler=-1 flags=0x0 payload=PayloadData
 // CHECK-DAG: Transform parent=0 kind=Matrix count=1 offset=0 size=64 stride=0 flags=0x0 scalar=float rows=4 cols=4 nested=none
 // CHECK-DAG: ShadowSphere parent=0 kind=Array count=4 offset=64 size=64 stride=16 flags=0x0 scalar=float rows=1 cols=4 nested=none

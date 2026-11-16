@@ -1,7 +1,7 @@
 // RUN: %radray_probe %s 60 3 | FileCheck %s --check-prefix=CHECK
 
-// CHECK-DAG: toolchain=0x0000000001090215
-// CHECK-DAG: toolchain=0x0000000001090215
+// CHECK-DAG: toolchain=0x0000000001090216
+// CHECK-DAG: toolchain=0x0000000001090216
 // CHECK-DAG: Shadow group=0 binding=0 kind=Sampler count=1 stages=0x2 placement=StaticSampler sampler=-1 flags=0x0 payload=none
 // CHECK-DAG: Shadow group=0 binding=1 kind=Sampler count=1 stages=0x2 placement=Table sampler=0 flags=0x0 payload=none
 // CHECK-DAG: MinPoint group=0 binding=1 kind=Sampler count=1 stages=0x2 placement=StaticSampler sampler=-1 flags=0x0 payload=none

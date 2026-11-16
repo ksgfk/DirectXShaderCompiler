@@ -1,5 +1,5 @@
 // Lit test driver for the RadRay DXC extension. Drives DiscoverSourceContract
-// plus CompileVariant against a source file and prints the decoded schema 9
+// plus CompileVariant against a source file and prints the decoded schema 10
 // wire so the compiler-side contract can be verified without the RadRay tree.
 // Build and run through the check-radray CMake target.
 
@@ -50,17 +50,20 @@ struct Wire {
 
   uint32_t U32(uint32_t offset) const {
     uint32_t value = 0;
-    std::memcpy(&value, Data + offset, sizeof(value));
+    for (size_t i = 0; i < sizeof(value); ++i)
+      value |= uint32_t(Data[offset + i]) << (i * 8);
     return value;
   }
   uint16_t U16(uint32_t offset) const {
     uint16_t value = 0;
-    std::memcpy(&value, Data + offset, sizeof(value));
+    for (size_t i = 0; i < sizeof(value); ++i)
+      value |= uint32_t(Data[offset + i]) << (i * 8);
     return value;
   }
   float F32(uint32_t offset) const {
     float value = 0.0f;
-    std::memcpy(&value, Data + offset, sizeof(value));
+    const uint32_t bits = U32(offset);
+    std::memcpy(&value, &bits, sizeof(value));
     return value;
   }
   std::string Text(uint32_t offset) const {
@@ -96,7 +99,7 @@ const char *PlacementName(uint32_t placement) {
 std::string PayloadName(const Wire &wire, uint32_t typeOffset,
                         uint32_t typeBytes, uint32_t typeIndex) {
   constexpr uint32_t kNoType = 0xffffffffu;
-  constexpr uint32_t kTypeStride = 64u;
+  constexpr uint32_t kTypeStride = 44u;
   if (typeIndex == kNoType)
     return std::string("none");
   if ((typeBytes % kTypeStride) != 0 || typeIndex >= typeBytes / kTypeStride)
@@ -158,7 +161,7 @@ void PrintLane(const char *label, RadRayDxcLaneView lane) {
   std::printf("\n=== %s lane: metadata %u bytes, bytecode %u bytes ===\n",
               label, lane.Metadata.Size, lane.Bytecode.Size);
   if (wire.Size < 152) {
-    std::printf("  metadata too small for a schema 9 envelope\n");
+    std::printf("  metadata too small for a schema 10 envelope\n");
     return;
   }
   std::printf("  schema=%u headerSize=%u total=%u target=%u stageMask=0x%x\n",
@@ -176,66 +179,69 @@ void PrintLane(const char *label, RadRayDxcLaneView lane) {
   const uint32_t rootSignatureBytes = wire.U32(68);
   std::printf("  rootSignature=%u bytes\n", rootSignatureBytes);
 
-  std::printf("  bindings (%u):\n", bindingBytes / 48);
+  std::printf("  bindings (%u):\n", bindingBytes / 36);
   for (uint32_t offset = bindingOffset; offset < bindingOffset + bindingBytes;
-       offset += 48) {
+       offset += 36) {
     const std::string payload =
-        PayloadName(wire, typeOffset, typeBytes, wire.U32(offset + 40));
+        PayloadName(wire, typeOffset, typeBytes, wire.U32(offset + 28));
     std::printf("    %-16s group=%u binding=%u kind=%-18s count=%u "
                 "stages=0x%x placement=%-14s sampler=%d flags=0x%x "
                 "payload=%s\n",
                 wire.Text(offset).c_str(), wire.U32(offset + 8),
-                wire.U32(offset + 12), KindName(wire.U32(offset + 16)),
-                wire.U32(offset + 20), wire.U32(offset + 24),
-                PlacementName(wire.U32(offset + 28)),
-                static_cast<int32_t>(wire.U32(offset + 32)),
-                wire.U32(offset + 36), payload.c_str());
+                wire.U32(offset + 12), KindName(wire.U32(offset + 16) & 15u),
+                wire.U32(offset + 20), (wire.U32(offset + 16) >> 4) & 7u,
+                PlacementName((wire.U32(offset + 16) >> 7) & 3u),
+                static_cast<int32_t>(wire.U32(offset + 24)), 0u,
+                payload.c_str());
   }
 
-  constexpr uint32_t kTypeStride = 64u;
+  constexpr uint32_t kTypeStride = 44u;
   std::printf("  types (%u):\n", typeBytes / kTypeStride);
   for (uint32_t offset = typeOffset; offset < typeOffset + typeBytes;
        offset += kTypeStride) {
     const uint32_t parent = wire.U32(offset + 8);
-    const uint32_t kind = wire.U32(offset + 12);
-    const uint32_t typeIndex = wire.U32(offset + 36);
+    const uint32_t packed = wire.U32(offset + 12);
+    const uint32_t kind = packed & 7u;
+    const uint32_t typeIndex = wire.U32(offset + 32);
     std::printf("    %-16s parent=%d kind=%-6s count=%u offset=%u size=%u "
-                "stride=%u flags=0x%x scalar=%s rows=%u cols=%u nested=%s element=%s elementSize=%u matrixStride=%u\n",
+                "stride=%u flags=0x%x scalar=%s rows=%u cols=%u nested=%s "
+                "element=%s elementSize=%u matrixStride=%u\n",
                 wire.Text(offset).c_str(), static_cast<int32_t>(parent),
                 TypeKindName(kind), wire.U32(offset + 16),
                 wire.U32(offset + 20), wire.U32(offset + 24),
-                wire.U32(offset + 28), wire.U32(offset + 32),
-                ScalarKindName(wire.U32(offset + 40)), wire.U32(offset + 44),
-                wire.U32(offset + 48),
+                wire.U32(offset + 28), (packed >> 15) & 1u,
+                ScalarKindName((packed >> 6) & 7u), (packed >> 9) & 7u,
+                (packed >> 12) & 7u,
                 PayloadName(wire, typeOffset, typeBytes, typeIndex).c_str(),
-                TypeKindName(wire.U32(offset + 52)), wire.U32(offset + 56), wire.U32(offset + 60));
+                TypeKindName((packed >> 3) & 7u), wire.U32(offset + 36),
+                wire.U32(offset + 40));
   }
 
-  std::printf("  root constants (%u):\n", rootConstantBytes / 36);
+  std::printf("  root constants (%u):\n", rootConstantBytes / 32);
   for (uint32_t offset = rootConstantOffset;
-       offset < rootConstantOffset + rootConstantBytes; offset += 36) {
+       offset < rootConstantOffset + rootConstantBytes; offset += 32) {
     const std::string payload =
-        PayloadName(wire, typeOffset, typeBytes, wire.U32(offset + 32));
+        PayloadName(wire, typeOffset, typeBytes, wire.U32(offset + 28));
     std::printf("    %-16s space=%u register=%u offset=%u size=%u stages=0x%x "
                 "flags=0x%x payload=%s\n",
                 wire.Text(offset).c_str(), wire.U32(offset + 8),
                 wire.U32(offset + 12), wire.U32(offset + 16),
-                wire.U32(offset + 20), wire.U32(offset + 24),
-                wire.U32(offset + 28), payload.c_str());
+                wire.U32(offset + 20), wire.U32(offset + 24) & 7u,
+                (wire.U32(offset + 24) >> 3) & 1u, payload.c_str());
   }
 
-  std::printf("  samplers (%u):\n", samplerBytes / 64);
+  std::printf("  samplers (%u):\n", samplerBytes / 20);
   for (uint32_t offset = samplerOffset; offset < samplerOffset + samplerBytes;
-       offset += 64) {
+       offset += 20) {
+    const auto packed = wire.U32(offset);
     std::printf(
         "    mag=%u min=%u mip=%u addr=%u/%u/%u bias=%.1f aniso=%u/%.1f "
         "cmp=%u/%u lod=%.1f..%.1f border=%u reduction=%u flags=0x%x\n",
-        wire.U32(offset), wire.U32(offset + 4), wire.U32(offset + 8),
-        wire.U32(offset + 12), wire.U32(offset + 16), wire.U32(offset + 20),
-        wire.F32(offset + 24), wire.U32(offset + 28), wire.F32(offset + 32),
-        wire.U32(offset + 36), wire.U32(offset + 40), wire.F32(offset + 44),
-        wire.F32(offset + 48), wire.U32(offset + 52), wire.U32(offset + 56),
-        wire.U32(offset + 60));
+        packed & 1u, (packed >> 1) & 1u, (packed >> 2) & 1u, (packed >> 3) & 7u,
+        (packed >> 6) & 7u, (packed >> 9) & 7u, wire.F32(offset + 4),
+        (packed >> 12) & 1u, wire.F32(offset + 8), (packed >> 13) & 1u,
+        (packed >> 14) & 7u, wire.F32(offset + 12), wire.F32(offset + 16),
+        (packed >> 17) & 7u, (packed >> 20) & 3u, (packed >> 22) & 1u);
   }
 }
 

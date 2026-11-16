@@ -27,9 +27,12 @@ inline constexpr IID IID_IRadRayDxcResult{
 
 inline constexpr uint32_t kRadRayDxcAbiVersion = 5;
 inline constexpr uint32_t kRadRayDxcLegacyMetadataSchemaVersion = 4;
-// Schema 9 separates array elements, matrix stride, accessed span and buffer allocation size.
+// Schema 10 uses explicit little-endian compact records
+// (entry/binding/type/push/vertex/sampler: 20/36/44/32/20/20 bytes), with
+// interned name ranges and canonical GPU interface hashing. Array elements,
+// matrix stride, accessed span and buffer allocation size remain explicit.
 // Earlier metadata schemas must be regenerated; the COM ABI remains unchanged.
-inline constexpr uint32_t kRadRayDxcMetadataSchemaVersion = 9;
+inline constexpr uint32_t kRadRayDxcMetadataSchemaVersion = 10;
 inline constexpr uint32_t kRadRayDxcShaderWireMagic = 0x59524452u;
 inline constexpr uint16_t kRadRayDxcShaderWireSchemaVersion = 2;
 inline constexpr uint32_t kRadRayDxcDiscoveryWireMagic = 0x44524452u;

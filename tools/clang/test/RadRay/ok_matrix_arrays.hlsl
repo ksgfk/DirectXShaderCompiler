@@ -1,8 +1,8 @@
 // RUN: %radray_probe %s | FileCheck %s
 // CHECK: compile status=0
-// CHECK: schema=9
+// CHECK: schema=10
 // CHECK: Matrices{{.*}}kind=Array{{.*}}count=2 offset=0 size=92 stride=48{{.*}}rows=3 cols=3{{.*}}element=Matrix elementSize=44 matrixStride=16
-// CHECK: schema=9
+// CHECK: schema=10
 // CHECK: Matrices{{.*}}kind=Array{{.*}}count=2 offset=0 size=92 stride=48{{.*}}rows=3 cols=3{{.*}}element=Matrix elementSize=44 matrixStride=16
 
 struct Payload { float3x3 Matrices[2]; };
