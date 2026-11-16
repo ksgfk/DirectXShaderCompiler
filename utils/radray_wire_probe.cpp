@@ -1,5 +1,5 @@
 // Lit test driver for the RadRay DXC extension. Drives DiscoverSourceContract
-// plus CompileVariant against a source file and prints the decoded schema 8
+// plus CompileVariant against a source file and prints the decoded schema 9
 // wire so the compiler-side contract can be verified without the RadRay tree.
 // Build and run through the check-radray CMake target.
 
@@ -96,7 +96,7 @@ const char *PlacementName(uint32_t placement) {
 std::string PayloadName(const Wire &wire, uint32_t typeOffset,
                         uint32_t typeBytes, uint32_t typeIndex) {
   constexpr uint32_t kNoType = 0xffffffffu;
-  constexpr uint32_t kTypeStride = 52u;
+  constexpr uint32_t kTypeStride = 64u;
   if (typeIndex == kNoType)
     return std::string("none");
   if ((typeBytes % kTypeStride) != 0 || typeIndex >= typeBytes / kTypeStride)
@@ -158,7 +158,7 @@ void PrintLane(const char *label, RadRayDxcLaneView lane) {
   std::printf("\n=== %s lane: metadata %u bytes, bytecode %u bytes ===\n",
               label, lane.Metadata.Size, lane.Bytecode.Size);
   if (wire.Size < 152) {
-    std::printf("  metadata too small for a schema 8 envelope\n");
+    std::printf("  metadata too small for a schema 9 envelope\n");
     return;
   }
   std::printf("  schema=%u headerSize=%u total=%u target=%u stageMask=0x%x\n",
@@ -176,9 +176,9 @@ void PrintLane(const char *label, RadRayDxcLaneView lane) {
   const uint32_t rootSignatureBytes = wire.U32(68);
   std::printf("  rootSignature=%u bytes\n", rootSignatureBytes);
 
-  std::printf("  bindings (%u):\n", bindingBytes / 44);
+  std::printf("  bindings (%u):\n", bindingBytes / 48);
   for (uint32_t offset = bindingOffset; offset < bindingOffset + bindingBytes;
-       offset += 44) {
+       offset += 48) {
     const std::string payload =
         PayloadName(wire, typeOffset, typeBytes, wire.U32(offset + 40));
     std::printf("    %-16s group=%u binding=%u kind=%-18s count=%u "
@@ -192,7 +192,7 @@ void PrintLane(const char *label, RadRayDxcLaneView lane) {
                 wire.U32(offset + 36), payload.c_str());
   }
 
-  constexpr uint32_t kTypeStride = 52u;
+  constexpr uint32_t kTypeStride = 64u;
   std::printf("  types (%u):\n", typeBytes / kTypeStride);
   for (uint32_t offset = typeOffset; offset < typeOffset + typeBytes;
        offset += kTypeStride) {
@@ -200,14 +200,15 @@ void PrintLane(const char *label, RadRayDxcLaneView lane) {
     const uint32_t kind = wire.U32(offset + 12);
     const uint32_t typeIndex = wire.U32(offset + 36);
     std::printf("    %-16s parent=%d kind=%-6s count=%u offset=%u size=%u "
-                "stride=%u flags=0x%x scalar=%s rows=%u cols=%u nested=%s\n",
+                "stride=%u flags=0x%x scalar=%s rows=%u cols=%u nested=%s element=%s elementSize=%u matrixStride=%u\n",
                 wire.Text(offset).c_str(), static_cast<int32_t>(parent),
                 TypeKindName(kind), wire.U32(offset + 16),
                 wire.U32(offset + 20), wire.U32(offset + 24),
                 wire.U32(offset + 28), wire.U32(offset + 32),
                 ScalarKindName(wire.U32(offset + 40)), wire.U32(offset + 44),
                 wire.U32(offset + 48),
-                PayloadName(wire, typeOffset, typeBytes, typeIndex).c_str());
+                PayloadName(wire, typeOffset, typeBytes, typeIndex).c_str(),
+                TypeKindName(wire.U32(offset + 52)), wire.U32(offset + 56), wire.U32(offset + 60));
   }
 
   std::printf("  root constants (%u):\n", rootConstantBytes / 36);

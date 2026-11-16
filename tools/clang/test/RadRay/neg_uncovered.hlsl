@@ -1,7 +1,7 @@
 // RUN: not %radray_probe %s 60 1 | FileCheck %s --check-prefix=DXIL
 // RUN: %radray_probe %s 60 2 | FileCheck %s --check-prefix=SPIRV
 
-// SPIRV-DAG: toolchain=0x0000000001090214
+// SPIRV-DAG: toolchain=0x0000000001090215
 // DXIL-DAG: [2121] resource 'Extra' is not covered by the [RootSignature] policy
 // DXIL-DAG: [2121] resource 'S' is not covered by the [RootSignature] policy
 // SPIRV-DAG: A group=0 binding=0 kind=CBuffer count=1 stages=0x2 placement=RootDescriptor sampler=-1 flags=0x0 payload=SceneData

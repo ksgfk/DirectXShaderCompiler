@@ -135,8 +135,8 @@ RadRay Extension Tests (Windows)
 -------------------------------
 
 The RadRay fork is based on upstream ``v1.9.2609`` and packages as
-``1.9.2609.radray.1``. It retains extension ABI 5 and metadata schema 8. The
-metadata toolchain identity is ``0x0000000001090214``; the 128-bit ABI identity
+``1.9.2609.radray.3``. It retains extension ABI 5 and metadata schema 9. The
+metadata toolchain identity is ``0x0000000001090215``; the 128-bit ABI identity
 also changes so artifacts and compiler caches from the July toolchain are not
 reused. Consumers must update their accepted toolchain identity and rebuild
 artifacts when adopting this package.
@@ -146,7 +146,7 @@ Configure with ``HLSL_INCLUDE_TESTS=ON``, ``LLVM_INCLUDE_TESTS=ON`` and
 ``CompilerTest::RadRayExtensionAbiAndDiscovery``. The ``RadRay`` lit suite
 exercises both DXIL and SPIR-V metadata, root signature policies, sampler
 translation, type payloads, deterministic metadata and rejected declarations.
-Its 16 fixtures cover 18 target combinations, using the CMake-built
+The fixtures cover individual and paired targets, using the CMake-built
 ``radray_wire_probe`` and FileCheck. These tests participate in ``check-clang``
 and ``check-all``; they do not require a RadRay checkout or a separate Python
 test runner.
@@ -237,3 +237,17 @@ a driver that can execute these shaders. See the next section on how this should
 be currently set up.
 
 To see a list of additional commands available, run `hcthelp`
+
+Schema 9 type layout
+~~~~~~~~~~~~~~~~~~~
+
+Type ``Size`` is the span ending at the last accessed byte, not trailing
+allocation padding. ``ElementSize`` and ``ElementKind`` describe one array
+element, ``Stride`` is zero for non-arrays, and ``MatrixStride`` records the
+physical vector stride. CBuffer bindings carry a separate ``BufferByteSize``.
+Logical matrix dimensions and major order use HLSL conventions on both lanes.
+Real member-offset differences still reject paired compilation.
+
+On Windows, run ``python utils/radray_matrix_regression.py <radray_wire_probe.exe>``
+to exercise all float matrix dimensions 2 through 4, both major orders, and
+single values / arrays of length 1 and 2 on each target and paired targets.

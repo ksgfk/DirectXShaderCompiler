@@ -91,10 +91,10 @@ using std::wstring;
 
 // Toolchain identity gates artifact trust on the RadRay side. Bump both values
 // together whenever compiler output semantics change, then regenerate goldens.
-constexpr uint8_t kToolchainIdentity[16] = {0x14, 0x02, 0x09, 0x01, 0x72, 0x61,
+constexpr uint8_t kToolchainIdentity[16] = {0x15, 0x02, 0x09, 0x01, 0x72, 0x61,
                                             0x64, 0x72, 0x61, 0x79, 0x2d, 0x31,
                                             0x2e, 0x39, 0x2e, 0x31};
-constexpr uint64_t kMetadataToolchainIdentity = 0x0000000001090214ull;
+constexpr uint64_t kMetadataToolchainIdentity = 0x0000000001090215ull;
 constexpr uint32_t kMetadataScalarNone = 0;
 constexpr uint32_t kMetadataScalarFloat = 1;
 constexpr uint32_t kMetadataScalarSint = 2;
@@ -532,6 +532,7 @@ struct MetadataBindingFact {
   bool HasDeclarationRegister{false};
   uint32_t DeclarationRegisterSpace{0};
   uint32_t DeclarationRegisterNumber{0};
+  uint32_t BufferByteSize{0};
 };
 
 // Immutable sampler state in Vulkan semantics. The numeric values mirror the
@@ -607,6 +608,13 @@ struct TypeShape {
   uint32_t Flags{0};
 };
 
+struct MetadataFieldDeclarationFact {
+  string Parent;
+  string Name;
+  uint32_t ArrayDimensions{0};
+  uint32_t ElementCount{1};
+};
+
 struct MetadataTypeFact {
   string Name;
   uint32_t ParentIndex{kMetadataNoParent};
@@ -621,6 +629,9 @@ struct MetadataTypeFact {
   uint32_t ScalarKind{kMetadataScalarNone};
   uint32_t RowCount{1};
   uint32_t ColumnCount{1};
+  uint32_t ElementKind{0};
+  uint32_t ElementSize{0};
+  uint32_t MatrixStride{0};
 };
 
 struct MetadataRootConstantFact {
@@ -732,6 +743,7 @@ public:
 
   bool VisitFunctionDecl(clang::FunctionDecl *decl);
   bool VisitVarDecl(clang::VarDecl *decl);
+  bool VisitFieldDecl(clang::FieldDecl *decl);
   bool VisitHLSLBufferDecl(clang::HLSLBufferDecl *decl);
 
 private:
@@ -841,6 +853,7 @@ public:
   void AddEntry(clang::FunctionDecl &decl, string stage);
   void RecordDeclaration(const clang::NamedDecl &decl, MetadataBindingKind kind,
                          uint32_t count);
+  void RecordField(const clang::NamedDecl &decl, clang::QualType type, string parent);
   void RecordRootSignature(const clang::FunctionDecl &decl,
                            const clang::HLSLRootSignatureAttr &attribute);
   const MetadataDeclarationFact *FindDeclaration(string_view name) const {
@@ -922,6 +935,7 @@ private:
   // AST-owned policy frontend state. Both lanes read exactly these facts, so a
   // lane never needs a second compile to learn the policy.
   vector<MetadataDeclarationFact> _declarations;
+  vector<MetadataFieldDeclarationFact> _fields;
   vector<MetadataPolicyParameter> _policy;
   vector<MetadataSamplerFact> _policySamplers;
   string _rootSignatureSource;
@@ -1072,7 +1086,31 @@ uint32_t HlslResourceArrayCount(const clang::ASTContext &context,
   return count;
 }
 
+bool RadRayContractAstVisitor::VisitFieldDecl(clang::FieldDecl *decl) {
+  _collector.RecordField(*decl, decl->getType(), decl->getParent()->getName().str());
+  return true;
+}
+
+void RadRayContractCollector::RecordField(const clang::NamedDecl &decl, clang::QualType type, string parent) {
+  MetadataFieldDeclarationFact fact;
+  fact.Parent = std::move(parent);
+  fact.Name = decl.getName().str();
+  const clang::ASTContext &context = decl.getASTContext();
+  while (const auto *array = context.getAsArrayType(type)) {
+    ++fact.ArrayDimensions;
+    const auto *constant = llvm::dyn_cast<clang::ConstantArrayType>(array);
+    if (constant == nullptr || constant->getSize().getLimitedValue() > UINT_MAX)
+      fact.ElementCount = 0;
+    else if (fact.ArrayDimensions == 1)
+      fact.ElementCount = static_cast<uint32_t>(constant->getSize().getLimitedValue());
+    type = array->getElementType();
+  }
+  _fields.push_back(std::move(fact));
+}
+
 bool RadRayContractAstVisitor::VisitVarDecl(clang::VarDecl *decl) {
+  if (const auto *buffer = llvm::dyn_cast<clang::HLSLBufferDecl>(decl->getDeclContext()))
+    _collector.RecordField(*decl, decl->getType(), buffer->getName().str());
   if (!decl->isFileVarDecl())
     return true;
   const clang::ASTContext &context = decl->getASTContext();
@@ -1596,7 +1634,10 @@ bool SameTypePayload(const MetadataTypeFact &left,
          left.UnderlyingType == right.UnderlyingType &&
          left.ScalarKind == right.ScalarKind &&
          left.RowCount == right.RowCount &&
-         left.ColumnCount == right.ColumnCount;
+         left.ColumnCount == right.ColumnCount &&
+         left.ElementKind == right.ElementKind &&
+         left.ElementSize == right.ElementSize &&
+         left.MatrixStride == right.MatrixStride;
 }
 
 bool ResolveMetadataTypeIndices(vector<MetadataTypeFact> &types) {
@@ -1634,7 +1675,8 @@ string DxilStructName(const llvm::StructType *type) {
 
 uint32_t CollectDxilTypeFacts(const hlsl::DxilTypeSystem &typeSystem,
                               const llvm::StructType *root,
-                              MetadataFacts &facts) {
+                              MetadataFacts &facts,
+                              const vector<MetadataFieldDeclarationFact> &fields) {
   vector<const llvm::StructType *> ordered;
   const auto collectType = [&](const llvm::Type *type,
                                const auto &self) -> void {
@@ -1705,44 +1747,90 @@ uint32_t CollectDxilTypeFacts(const hlsl::DxilTypeSystem &typeSystem,
         fieldAnnotation = &emptyAnnotation;
       const llvm::Type *fieldType = type->getElementType(fieldIndex);
       const uint32_t offset = offsets[fieldIndex];
-      const uint32_t nextOffset = fieldIndex + 1 < offsets.size()
-                                      ? offsets[fieldIndex + 1]
-                                      : parentSize;
-      const uint32_t size =
-          nextOffset >= offset
-              ? nextOffset - offset
-              : DxilAnnotatedTypeSize(fieldType, *fieldAnnotation, typeSystem);
-      uint32_t stride =
-          DxilAnnotatedTypeSize(fieldType, *fieldAnnotation, typeSystem);
-      uint32_t elementCount = 1;
-      string underlying;
-      uint32_t kind = DxilFieldKind(fieldType, *fieldAnnotation);
-      if (kind == 3u)
-        stride = size;
-      if (const auto *arrayType = llvm::dyn_cast<llvm::ArrayType>(fieldType)) {
-        elementCount = static_cast<uint32_t>(arrayType->getNumElements());
-        stride = DxilTypeSize(arrayType->getElementType(), typeSystem);
-        if (const auto *elementStruct =
-                llvm::dyn_cast<llvm::StructType>(arrayType->getElementType()))
-          underlying = DxilStructName(elementStruct);
-      } else if (const auto *fieldStruct =
-                     llvm::dyn_cast<llvm::StructType>(fieldType)) {
-        underlying = DxilStructName(fieldStruct);
+      MetadataTypeFact fact;
+      fact.Name = fieldAnnotation->HasFieldName()
+                      ? fieldAnnotation->GetFieldName()
+                      : ("field" + std::to_string(fieldIndex));
+      fact.ParentIndex = parentIndex;
+      fact.Offset = offset;
+      const auto source = std::find_if(fields.begin(), fields.end(),
+          [&](const MetadataFieldDeclarationFact &field) {
+            return field.Parent == typeName && field.Name == fact.Name;
+          });
+      if (source != fields.end() &&
+          (source->ArrayDimensions > 1 || source->ElementCount == 0))
+        return kMetadataNoType;
+      bool isArray = source != fields.end() ? source->ArrayDimensions != 0
+                                           : llvm::isa<llvm::ArrayType>(fieldType) && !fieldAnnotation->HasMatrixAnnotation();
+      const llvm::Type *element = fieldType;
+      if (isArray) {
+        const auto *array = llvm::dyn_cast<llvm::ArrayType>(fieldType);
+        if (array == nullptr)
+          return kMetadataNoType;
+        fact.ElementCount = source != fields.end() ? source->ElementCount
+            : static_cast<uint32_t>(array->getNumElements());
+        element = array->getElementType();
       }
-      if (kind == 3u) {
-        elementCount = 1u;
-        stride = size;
+      fact.ElementKind = DxilFieldKind(element, *fieldAnnotation);
+      fact.Kind = isArray ? 5u : fact.ElementKind;
+      if (const auto *structure = llvm::dyn_cast<llvm::StructType>(element)) {
+        if (!fieldAnnotation->HasMatrixAnnotation()) {
+          fact.UnderlyingType = DxilStructName(structure);
+          const auto found = std::find_if(facts.Types.begin(), facts.Types.end(),
+              [&](const MetadataTypeFact &candidate) {
+                return candidate.ParentIndex == kMetadataNoParent && candidate.Name == fact.UnderlyingType;
+              });
+          if (found == facts.Types.end())
+            return kMetadataNoType;
+          fact.ElementSize = found->Size;
+          fact.RowCount = fact.ColumnCount = 0;
+        }
       }
-      string name = fieldAnnotation->HasFieldName()
-                        ? fieldAnnotation->GetFieldName()
-                        : ("field" + std::to_string(fieldIndex));
-      facts.Types.push_back({std::move(name), parentIndex, kind, elementCount,
-                             offset, size, stride, 0u, kMetadataNoType,
-                             std::move(underlying)});
-      if (kind != 4u)
-        ApplyTypeShape(facts.Types.back(),
-                       DxilTypeShape(fieldType, *fieldAnnotation));
+      if (fact.ElementKind != 4u) {
+        ApplyTypeShape(fact, DxilTypeShape(element, *fieldAnnotation));
+        if (!fieldAnnotation->HasCompType() || (fieldAnnotation->GetCompType().GetSizeInBits() != 32 && !fieldAnnotation->GetCompType().IsBoolTy()))
+          return kMetadataNoType;
+        if (fact.ElementKind == 3u) {
+          if (fact.ScalarKind != kMetadataScalarFloat || fact.RowCount < 2 || fact.RowCount > 4 ||
+              fact.ColumnCount < 2 || fact.ColumnCount > 4)
+            return kMetadataNoType;
+          // DXIL legacy cbuffer rows start at 128-bit registers.
+          fact.MatrixStride = 16;
+          const bool rowMajor = (fact.Flags & kMetadataTypeFlagRowMajor) != 0;
+          const uint32_t major = rowMajor ? fact.RowCount : fact.ColumnCount;
+          const uint32_t minor = rowMajor ? fact.ColumnCount : fact.RowCount;
+          fact.ElementSize = (major - 1) * fact.MatrixStride + minor * 4;
+        } else if (fact.ElementKind == 1u || fact.ElementKind == 2u) {
+          if (fact.ColumnCount < 1 || fact.ColumnCount > 4)
+            return kMetadataNoType;
+          fact.ElementSize = fact.ColumnCount * 4;
+        } else {
+          return kMetadataNoType;
+        }
+      }
+      if (isArray) {
+        // Each legacy cbuffer array element starts at a new register.
+        const uint64_t stride = (uint64_t(fact.ElementSize) + 15u) & ~uint64_t(15u);
+        const uint64_t span = (uint64_t(fact.ElementCount) - 1u) * stride + fact.ElementSize;
+        if (stride > UINT_MAX || span > UINT_MAX)
+          return kMetadataNoType;
+        fact.Stride = static_cast<uint32_t>(stride);
+        fact.Size = static_cast<uint32_t>(span);
+      } else {
+        fact.Size = fact.ElementSize;
+      }
+      if (fact.Size == 0 || uint64_t(fact.Offset) + fact.Size > parentSize)
+        return kMetadataNoType;
+      facts.Types.push_back(std::move(fact));
     }
+    auto &rootFact = facts.Types[parentIndex];
+    rootFact.Size = 0;
+    for (size_t child = parentIndex + 1; child < facts.Types.size(); ++child)
+      rootFact.Size = std::max(rootFact.Size, facts.Types[child].Offset + facts.Types[child].Size);
+    rootFact.ElementSize = rootFact.Size;
+    rootFact.ElementKind = 4u;
+    rootFact.Stride = 0;
+    rootFact.RowCount = rootFact.ColumnCount = 0;
   }
 
   if (!ResolveMetadataTypeIndices(facts.Types))
@@ -2458,9 +2546,15 @@ void RadRayContractCollector::CollectDxilModule(llvm::Module &module) {
     const uint32_t typeIndex =
         type == nullptr
             ? kMetadataNoType
-            : CollectDxilTypeFacts(dxil.GetTypeSystem(), type, _metadata);
-    if (fact != nullptr)
+            : CollectDxilTypeFacts(dxil.GetTypeSystem(), type, _metadata, _fields);
+    if (fact != nullptr) {
       fact->TypeIndex = typeIndex;
+      const uint64_t bytes = (uint64_t(resource->GetSize()) + 15u) & ~uint64_t(15u);
+      if (bytes > UINT_MAX)
+        _diagnostics.push_back({2107, "DXIL constant buffer size overflows"});
+      else
+        fact->BufferByteSize = static_cast<uint32_t>(bytes);
+    }
     if (fact != nullptr && typeIndex == kMetadataNoType)
       _diagnostics.push_back(
           {2107, "DXIL constant buffer has no valid root type metadata"});
@@ -2604,8 +2698,8 @@ TypeShape SpirvTypeShape(const clang::spirv::SpirvType *type,
     type = runtimeArray->getElementType();
   if (const auto *matrix =
           llvm::dyn_cast_or_null<clang::spirv::MatrixType>(type)) {
-    shape.RowCount = matrix->numRows();
-    shape.ColumnCount = matrix->numCols();
+    shape.RowCount = matrix->numCols();
+    shape.ColumnCount = matrix->numRows();
     // SPIR-V RowMajor is the memory decoration, which is inverted relative to
     // HLSL authoring: default column_major lands as SPIR-V RowMajor. Persist
     // the HLSL majorness so both lanes describe the same CPU/GPU POD layout.
@@ -2665,44 +2759,77 @@ uint32_t CollectSpirvStructFacts(const clang::spirv::StructType *structure,
   for (size_t fieldIndex = 0; fieldIndex < fields.size(); ++fieldIndex) {
     const auto &field = fields[fieldIndex];
     const clang::spirv::SpirvType *fieldType = field.type;
-    uint32_t kind = 1;
-    uint32_t count = 1;
-    uint32_t stride = SpirvTypeSize(fieldType);
-    string underlying;
-    if (field.matrixStride.hasValue() &&
-        llvm::isa<clang::spirv::MatrixType>(fieldType)) {
-      kind = 3;
-      const auto *matrix = llvm::cast<clang::spirv::MatrixType>(fieldType);
-      stride = SpirvTypeSize(matrix);
-    } else if (const auto *array =
-                   llvm::dyn_cast<clang::spirv::ArrayType>(fieldType)) {
-      kind = 5;
-      count = array->getElementCount();
-      stride = array->getStride().hasValue()
-                   ? array->getStride().getValue()
-                   : SpirvTypeSize(array->getElementType());
-      if (const auto *elementStruct =
-              llvm::dyn_cast<clang::spirv::StructType>(array->getElementType()))
-        underlying = SpirvStructName(elementStruct);
-    } else if (const auto *fieldStruct =
-                   llvm::dyn_cast<clang::spirv::StructType>(fieldType)) {
-      kind = 4;
-      underlying = SpirvStructName(fieldStruct);
-    } else if (llvm::isa<clang::spirv::VectorType>(fieldType)) {
-      kind = 2;
+    MetadataTypeFact fact;
+    fact.Name = field.name;
+    fact.ParentIndex = parentIndex;
+    fact.Offset = field.offset.hasValue() ? field.offset.getValue() : 0;
+    const auto *array = llvm::dyn_cast<clang::spirv::ArrayType>(fieldType);
+    const auto *element = array != nullptr ? array->getElementType() : fieldType;
+    if (llvm::isa<clang::spirv::ArrayType>(element) ||
+        llvm::isa<clang::spirv::RuntimeArrayType>(element))
+      return kMetadataNoType;
+    if (const auto *nested = llvm::dyn_cast<clang::spirv::StructType>(element)) {
+      fact.ElementKind = 4u;
+      fact.UnderlyingType = SpirvStructName(nested);
+      const auto found = std::find_if(facts.Types.begin(), facts.Types.end(),
+          [&](const MetadataTypeFact &candidate) {
+            return candidate.ParentIndex == kMetadataNoParent && candidate.Name == fact.UnderlyingType;
+          });
+      if (found == facts.Types.end())
+        return kMetadataNoType;
+      fact.ElementSize = found->Size;
+      fact.RowCount = fact.ColumnCount = 0;
+    } else {
+      ApplyTypeShape(fact, SpirvTypeShape(element, field.isRowMajor));
+      const clang::spirv::SpirvType *scalar = element;
+      if (const auto *matrix = llvm::dyn_cast<clang::spirv::MatrixType>(element)) {
+        fact.ElementKind = 3u;
+        scalar = matrix->getElementType();
+        if (!field.matrixStride.hasValue() || fact.RowCount < 2 || fact.RowCount > 4 ||
+            fact.ColumnCount < 2 || fact.ColumnCount > 4 || fact.ScalarKind != kMetadataScalarFloat)
+          return kMetadataNoType;
+        fact.MatrixStride = field.matrixStride.getValue();
+        const bool rowMajor = (fact.Flags & kMetadataTypeFlagRowMajor) != 0;
+        const uint32_t major = rowMajor ? fact.RowCount : fact.ColumnCount;
+        const uint32_t minor = rowMajor ? fact.ColumnCount : fact.RowCount;
+        fact.ElementSize = (major - 1) * fact.MatrixStride + minor * 4;
+      } else if (const auto *vector = llvm::dyn_cast<clang::spirv::VectorType>(element)) {
+        fact.ElementKind = 2u;
+        scalar = vector->getElementType();
+        fact.ElementSize = fact.ColumnCount * 4;
+      } else {
+        fact.ElementKind = 1u;
+        fact.ElementSize = 4;
+      }
+      const auto *number = llvm::dyn_cast<clang::spirv::NumericalType>(scalar);
+      if (number == nullptr || number->getBitwidth() != 32)
+        return kMetadataNoType;
     }
-    const uint32_t offset =
-        field.offset.hasValue() ? field.offset.getValue() : 0;
-    const uint32_t sizeInBytes = field.sizeInBytes.hasValue()
-                                     ? field.sizeInBytes.getValue()
-                                     : stride * count;
-    facts.Types.push_back({field.name, parentIndex, kind, count, offset,
-                           sizeInBytes, stride, 0u, kMetadataNoType,
-                           std::move(underlying)});
-    if (kind != 4u)
-      ApplyTypeShape(facts.Types.back(),
-                     SpirvTypeShape(fieldType, field.isRowMajor));
+    fact.Kind = array != nullptr ? 5u : fact.ElementKind;
+    fact.ElementCount = array != nullptr ? array->getElementCount() : 1u;
+    if (fact.ElementCount == 0)
+      return kMetadataNoType;
+    if (array != nullptr) {
+      if (!array->getStride().hasValue())
+        return kMetadataNoType;
+      fact.Stride = array->getStride().getValue();
+      if (fact.Stride < fact.ElementSize)
+        return kMetadataNoType;
+    }
+    const uint64_t span = uint64_t(fact.ElementCount - 1) * fact.Stride + fact.ElementSize;
+    if (span == 0 || span > UINT_MAX || uint64_t(fact.Offset) + span > size)
+      return kMetadataNoType;
+    fact.Size = static_cast<uint32_t>(span);
+    facts.Types.push_back(std::move(fact));
   }
+  auto &rootFact = facts.Types[parentIndex];
+  rootFact.Size = 0;
+  for (size_t child = parentIndex + 1; child < facts.Types.size(); ++child)
+    rootFact.Size = std::max(rootFact.Size, facts.Types[child].Offset + facts.Types[child].Size);
+  rootFact.ElementSize = rootFact.Size;
+  rootFact.ElementKind = 4u;
+  rootFact.Stride = 0;
+  rootFact.RowCount = rootFact.ColumnCount = 0;
   if (!ResolveMetadataTypeIndices(facts.Types))
     return kMetadataNoType;
   return parentIndex;
@@ -2999,8 +3126,14 @@ void RadRayContractCollector::CollectSpirvAction(clang::EmitSpirvAction &action,
       const auto *structure =
           llvm::dyn_cast<clang::spirv::StructType>(valueType);
       const uint32_t typeIndex = CollectSpirvStructFacts(structure, _metadata);
-      if (fact != nullptr)
+      if (fact != nullptr) {
         fact->TypeIndex = typeIndex;
+        const uint64_t bytes = (uint64_t(SpirvTypeSize(structure)) + 15u) & ~uint64_t(15u);
+        if (bytes > UINT_MAX)
+          _diagnostics.push_back({2107, "SPIR-V constant buffer size overflows"});
+        else
+          fact->BufferByteSize = static_cast<uint32_t>(bytes);
+      }
       if (fact != nullptr && typeIndex == kMetadataNoType)
         _diagnostics.push_back(
             {2107, "SPIR-V constant buffer has no valid root type metadata"});
@@ -3479,6 +3612,7 @@ struct WireBindingRecord {
   uint32_t Flags;
   // Lane-local owner in TypeRecords. Only CBuffer bindings may carry one.
   uint32_t TypeIndex;
+  uint32_t BufferByteSize;
 };
 
 struct WireTypeRecord {
@@ -3495,6 +3629,9 @@ struct WireTypeRecord {
   uint32_t ScalarKind;
   uint32_t RowCount;
   uint32_t ColumnCount;
+  uint32_t ElementKind;
+  uint32_t ElementSize;
+  uint32_t MatrixStride;
 };
 
 struct WireRootConstantRecord {
@@ -3544,9 +3681,9 @@ struct WireVertexInputRecord {
 
 static_assert(sizeof(WireEnvelope) == 152);
 static_assert(sizeof(WireEntryRecord) == 24);
-static_assert(sizeof(WireBindingRecord) == 44);
+static_assert(sizeof(WireBindingRecord) == 48);
 static_assert(offsetof(WireBindingRecord, TypeIndex) == 40);
-static_assert(sizeof(WireTypeRecord) == 52);
+static_assert(sizeof(WireTypeRecord) == 64);
 static_assert(offsetof(WireTypeRecord, ScalarKind) == 40);
 static_assert(sizeof(WireRootConstantRecord) == 36);
 static_assert(offsetof(WireRootConstantRecord, TypeIndex) == 32);
@@ -3571,6 +3708,9 @@ struct TypePayloadField {
   uint32_t ScalarKind{0};
   uint32_t RowCount{0};
   uint32_t ColumnCount{0};
+  uint32_t ElementKind{0};
+  uint32_t ElementSize{0};
+  uint32_t MatrixStride{0};
   string NestedName;
 };
 
@@ -3599,6 +3739,9 @@ void CopyTypeShape(TypePayloadField &field,
   field.ScalarKind = record.ScalarKind;
   field.RowCount = record.RowCount;
   field.ColumnCount = record.ColumnCount;
+  field.ElementKind = record.ElementKind;
+  field.ElementSize = record.ElementSize;
+  field.MatrixStride = record.MatrixStride;
 }
 
 bool SameTypePayloadField(const TypePayloadField &left,
@@ -3610,6 +3753,9 @@ bool SameTypePayloadField(const TypePayloadField &left,
          left.ScalarKind == right.ScalarKind &&
          left.RowCount == right.RowCount &&
          left.ColumnCount == right.ColumnCount &&
+         left.ElementKind == right.ElementKind &&
+         left.ElementSize == right.ElementSize &&
+         left.MatrixStride == right.MatrixStride &&
          left.NestedName == right.NestedName;
 }
 
@@ -3693,7 +3839,9 @@ bool LaneTypePayloadsAgree(const vector<uint8_t> &dxil,
       return false;
     }
     for (size_t field = 0; field < dxilRoot.Fields.size(); ++field) {
-      if (!SameTypePayloadField(dxilRoot.Fields[field], found->Fields[field])) {
+      const auto paired = std::find_if(found->Fields.begin(), found->Fields.end(),
+          [&](const TypePayloadField &candidate) { return candidate.Name == dxilRoot.Fields[field].Name; });
+      if (paired == found->Fields.end() || !SameTypePayloadField(dxilRoot.Fields[field], *paired)) {
         diagnostics.push_back(
             {2108, "DXIL and SPIR-V disagree on type metadata for '" +
                        dxilRoot.Name + "." + dxilRoot.Fields[field].Name +
@@ -3849,6 +3997,7 @@ bool MergeMetadataFacts(const ContractData &contract, RadRayDxcTarget target,
           found->Placement != binding.Placement ||
           found->SamplerIndex != binding.SamplerIndex ||
           found->TypeIndex != binding.TypeIndex ||
+          found->BufferByteSize != binding.BufferByteSize ||
           found->HasDeclarationRegister != binding.HasDeclarationRegister ||
           (binding.HasDeclarationRegister &&
            (found->DeclarationRegisterSpace !=
@@ -4042,6 +4191,7 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
     record.SamplerIndex = fact.SamplerIndex;
     record.Flags = fact.Flags;
     record.TypeIndex = fact.TypeIndex;
+    record.BufferByteSize = fact.BufferByteSize;
     bindings.push_back(record);
     currentNameOffset += static_cast<uint32_t>(fact.Name.size());
   }
@@ -4062,6 +4212,9 @@ bool BuildMetadata(const CompileRequest &request, const ContractData &contract,
     record.ScalarKind = fact.ScalarKind;
     record.RowCount = fact.RowCount;
     record.ColumnCount = fact.ColumnCount;
+    record.ElementKind = fact.ElementKind;
+    record.ElementSize = fact.ElementSize;
+    record.MatrixStride = fact.MatrixStride;
     types.push_back(record);
     currentNameOffset += static_cast<uint32_t>(fact.Name.size());
   }

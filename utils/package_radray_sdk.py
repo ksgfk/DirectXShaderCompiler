@@ -56,8 +56,8 @@ def read_package_version(repo_root: Path) -> str:
     return match.group(1)
 
 
-def archive_name(platform: str, arch: str) -> str:
-    return f"dxc-{platform}-{arch}.zip"
+def archive_name(platform: str, arch: str, version: str) -> str:
+    return f"dxc-{platform}-{arch}-{version}.zip"
 
 
 def run(args: list[str], cwd: Path | None = None) -> None:
@@ -134,9 +134,11 @@ def main() -> int:
         raise SystemExit(f"error: build directory is not configured: {build_dir}")
 
     version = args.version or read_package_version(repo_root)
+    if version != read_package_version(repo_root):
+        raise SystemExit("error: requested version differs from the source package version")
     out_dir = args.out.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    archive_path = out_dir / archive_name(args.platform, args.arch)
+    archive_path = out_dir / archive_name(args.platform, args.arch, version)
 
     if not args.no_build:
         run(["cmake", "-B", str(build_dir)])
